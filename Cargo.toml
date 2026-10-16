@@ -1,0 +1,13 @@
+[package]
+name = "unrealfs"
+version = "0.1.0"
+edition = "2024"
+description = "A pure Rust library for parsing and reading assets from Unreal Engine packages (.uasset/.uexp/.ubulk)"
+license = "MIT"
+repository = "https://github.com/lmmtrr/unrealfs"
+readme = "README.md"
+
+[dependencies]
+ruzstd = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+texture2ddecoder = "0.1"

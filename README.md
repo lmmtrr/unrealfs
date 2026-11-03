@@ -2,7 +2,7 @@
 
 A pure Rust library for parsing and reading assets from Unreal Engine packages (`.uasset` / `.uexp` / `.ubulk`), with optional `.usmap` mappings for unversioned properties.
 
-Supports static meshes, skeletal meshes (bones, sockets, morph targets, physics bodies), materials, textures and animations (including ACL-compressed tracks).
+Supports static meshes, skeletal meshes (bones, sockets, morph targets, physics bodies), materials, textures, animations (including ACL-compressed tracks) and spine-ue4 assets (extracted back to `.atlas` / `.json`·`.skel` / `.png`).
 
 ## Usage
 

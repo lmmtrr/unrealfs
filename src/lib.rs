@@ -9,6 +9,7 @@ pub mod package;
 pub mod properties;
 pub mod reader;
 pub mod skeletal_mesh;
+pub mod spine;
 pub mod static_mesh;
 pub mod texture;
 pub mod unversioned;

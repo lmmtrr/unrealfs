@@ -1,5 +1,7 @@
 use crate::reader::{Reader, Result};
 use crate::usmap::Mappings;
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 const PACKAGE_TAG: u32 = 0x9E2A83C1;
@@ -244,7 +246,41 @@ fn read_data_resources(r: &mut Reader, offset: i32) -> Result<Vec<DataResource>>
         .collect()
 }
 
+pub fn is_package_header(head: &[u8]) -> bool {
+    head.len() >= 4 && u32::from_le_bytes([head[0], head[1], head[2], head[3]]) == PACKAGE_TAG
+}
+
 impl Package {
+    pub fn parse_header(path: &str, uasset: &[u8]) -> Result<Package> {
+        Package::parse(path, uasset, Vec::new(), None)
+    }
+
+    pub fn open(uasset: &Path) -> Result<Package> {
+        let bytes = std::fs::read(uasset).map_err(|e| format!("{}: {}", uasset.display(), e))?;
+        let uexp_path = uasset.with_extension("uexp");
+        let uexp = std::fs::read(&uexp_path).map_err(|e| format!("{}: {}", uexp_path.display(), e))?;
+        let ubulk = std::fs::read(uasset.with_extension("ubulk")).ok();
+        Package::parse(&uasset.to_string_lossy(), &bytes, uexp, ubulk)
+    }
+
+    pub fn imported_packages(&self) -> Vec<&str> {
+        self.imports
+            .iter()
+            .filter(|imp| imp.outer_index == 0 && imp.class_name == "Package")
+            .map(|imp| imp.object_name.as_str())
+            .collect()
+    }
+
+    pub fn asset_class_counts(&self) -> BTreeMap<String, u32> {
+        let mut types = BTreeMap::new();
+        for export in self.exports.iter().filter(|e| e.outer_index == 0) {
+            if let Some(class) = self.export_class_name(export) {
+                *types.entry(class.to_string()).or_insert(0) += 1;
+            }
+        }
+        types
+    }
+
     pub fn parse(path: &str, uasset: &[u8], uexp: Vec<u8>, ubulk: Option<Vec<u8>>) -> Result<Package> {
         let mut r = Reader::new(uasset);
         let summary = match read_summary(&mut r, true) {

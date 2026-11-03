@@ -23,6 +23,7 @@ use serde::Serialize;
 use skeletal_mesh::{read_morph_targets, read_physics_bodies, read_skeletal_mesh, read_sockets, MeshData, Profile, Socket};
 use static_mesh::read_static_mesh;
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use usmap::Mappings;
 
@@ -86,6 +87,44 @@ fn is_mappings_file(path: &str) -> bool {
 
 pub fn is_unreal_file(path: &str) -> bool {
     split_package_path(path).is_some() || is_mappings_file(path)
+}
+
+pub fn package_files(uasset: &Path) -> Vec<PathBuf> {
+    let mut out = vec![uasset.to_path_buf()];
+    for ext in ["uexp", "ubulk"] {
+        let p = uasset.with_extension(ext);
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+pub fn read_package_files(name: &str, uasset: &Path) -> Vec<(String, Vec<u8>)> {
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    package_files(uasset)
+        .into_iter()
+        .filter_map(|p| {
+            let ext = p.extension()?.to_string_lossy().into_owned();
+            std::fs::read(&p).ok().map(|bytes| (format!("{}.{}", stem, ext), bytes))
+        })
+        .collect()
+}
+
+pub fn find_mappings(dir: &Path, depth: usize) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            dirs.push(p);
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("usmap")) {
+            return Some(p);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    dirs.iter().find_map(|d| find_mappings(d, depth - 1))
 }
 
 #[derive(Default)]

@@ -152,6 +152,7 @@ fn read_simple_value(pkg: &Package, r: &mut Reader, ty: &str, size: usize) -> Re
         "FloatProperty" => PropValue::Float(r.f32()?),
         "ObjectProperty" | "SoftObjectProperty" if size == 4 => PropValue::Object(r.i32()?),
         "ObjectProperty" => PropValue::Object(r.i32()?),
+        "SoftObjectProperty" | "SoftClassProperty" => PropValue::Name(read_soft_object_path(pkg, r)?),
         "NameProperty" => PropValue::Name(pkg.read_name(r)?),
         "StrProperty" => PropValue::Name(r.fstring()?),
         "ByteProperty" | "EnumProperty" if size == 8 => PropValue::Name(pkg.read_name(r)?),
@@ -159,6 +160,23 @@ fn read_simple_value(pkg: &Package, r: &mut Reader, ty: &str, size: usize) -> Re
         _ => PropValue::Other,
     })
 }
+
+fn read_soft_object_path(pkg: &Package, r: &mut Reader) -> Result<String> {
+    let mut path = pkg.read_name(r)?;
+    if pkg.is_ue5 && pkg.ue5_version >= UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES {
+        let asset = pkg.read_name(r)?;
+        if asset != "None" {
+            path = format!("{}.{}", path, asset);
+        }
+    }
+    let sub = r.fstring()?;
+    if !sub.is_empty() {
+        path = format!("{}:{}", path, sub);
+    }
+    Ok(path)
+}
+
+const UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES: i32 = 1007;
 
 fn read_real(pkg: &Package, r: &mut Reader) -> Result<f32> {
     if pkg.large_world_coordinates() {
@@ -179,7 +197,8 @@ fn read_struct_value(pkg: &Package, r: &mut Reader, struct_name: &str) -> Result
             let b = r.bytes(4)?;
             PropValue::Color([b[2] as f32 / 255.0, b[1] as f32 / 255.0, b[0] as f32 / 255.0, b[3] as f32 / 255.0])
         }
-        "Guid" | "IntPoint" | "Vector2D" | "Box" | "Box2D" | "SoftObjectPath" | "PerPlatformFloat"
+        "SoftObjectPath" | "SoftClassPath" => PropValue::Name(read_soft_object_path(pkg, r)?),
+        "Guid" | "IntPoint" | "Vector2D" | "Box" | "Box2D" | "PerPlatformFloat"
         | "PerPlatformInt" | "FrameNumber" | "Timespan" | "DateTime" => PropValue::Other,
         _ => PropValue::Struct(read_tagged_properties(pkg, r)?),
     })

@@ -3,6 +3,7 @@
 pub mod acl;
 pub mod animation;
 pub mod bulk;
+pub mod data_table;
 pub mod material;
 pub mod package;
 pub mod properties;

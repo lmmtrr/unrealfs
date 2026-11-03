@@ -21,7 +21,7 @@ use serde::Serialize;
 use skeletal_mesh::{read_morph_targets, read_physics_bodies, read_skeletal_mesh, read_sockets, MeshData, Profile, Socket};
 use static_mesh::read_static_mesh;
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 use usmap::Mappings;
 
 #[derive(Default)]
@@ -93,7 +93,7 @@ pub struct UeEnvironment {
     errors: Vec<String>,
     meshes: HashMap<String, MeshData>,
     last_profile: Option<Profile>,
-    mappings: Option<Rc<Mappings>>,
+    mappings: Option<Arc<Mappings>>,
 }
 
 impl UeEnvironment {
@@ -138,7 +138,7 @@ impl UeEnvironment {
     }
 
     pub fn set_mappings(&mut self, mappings: Mappings) {
-        let mappings = Rc::new(mappings);
+        let mappings = Arc::new(mappings);
         for pkg in self.packages.values_mut() {
             pkg.mappings = Some(mappings.clone());
         }

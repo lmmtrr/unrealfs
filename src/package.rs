@@ -1,6 +1,6 @@
 use crate::reader::{Reader, Result};
 use crate::usmap::Mappings;
-use std::rc::Rc;
+use std::sync::Arc;
 
 const PACKAGE_TAG: u32 = 0x9E2A83C1;
 const PKG_FILTER_EDITOR_ONLY: u32 = 0x8000_0000;
@@ -48,7 +48,7 @@ pub struct Package {
     pub ue5_version: i32,
     pub unversioned_properties: bool,
     pub soft_object_path_list: bool,
-    pub mappings: Option<Rc<Mappings>>,
+    pub mappings: Option<Arc<Mappings>>,
     pub data_resources: Option<Vec<DataResource>>,
     pub uexp: Vec<u8>,
     pub ubulk: Option<Vec<u8>>,

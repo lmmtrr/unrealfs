@@ -136,10 +136,10 @@ fn common_prefix(a: &str, b: &str) -> usize {
     a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
-pub struct SpineFiles {
-    pub skeleton: PathBuf,
-    pub atlas: Option<PathBuf>,
-    pub textures: Vec<PathBuf>,
+pub struct SpineOutput {
+    pub package: String,
+    pub file_name: String,
+    pub data: Vec<u8>,
 }
 
 fn safe_file_name(name: &str) -> String {
@@ -150,7 +150,7 @@ fn safe_file_name(name: &str) -> String {
 }
 
 impl crate::UeEnvironment {
-    pub fn extract_spine(&mut self, out_dir: &Path) -> std::result::Result<Vec<SpineFiles>, String> {
+    pub fn spine_outputs(&mut self) -> std::result::Result<Vec<SpineOutput>, String> {
         self.parse_pending();
         let mut atlases = Vec::new();
         let mut skeletons = Vec::new();
@@ -173,8 +173,8 @@ impl crate::UeEnvironment {
             self.errors.extend(errors);
             return Err("no Spine skeleton (SpineSkeletonDataAsset) found".to_string());
         }
-        std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
         let mut used_names = std::collections::HashSet::new();
+        let mut used_pages = std::collections::HashSet::new();
         let mut out = Vec::new();
         for (key, skel) in &skeletons {
             let skel_key = base_key(skel.file_name.as_deref().unwrap_or(&skel.name));
@@ -187,8 +187,7 @@ impl crate::UeEnvironment {
                         let k = base_key(a.file_name.as_deref().unwrap_or(&a.name));
                         (k == skel_key, common_prefix(&k, &skel_key))
                     })
-                })
-                .map(|(_, a)| a);
+                });
             let mut base = safe_file_name(file_stem(skel.file_name.as_deref().unwrap_or(&skel.name)));
             if base.is_empty() {
                 base = "skeleton".to_string();
@@ -199,45 +198,62 @@ impl crate::UeEnvironment {
                 base = format!("{}_{}", first, n);
                 n += 1;
             }
-            let skeleton_path = out_dir.join(format!("{}.{}", base, if skel.is_binary() { "skel" } else { "json" }));
-            std::fs::write(&skeleton_path, &skel.data).map_err(|e| e.to_string())?;
-            let mut files = SpineFiles { skeleton: skeleton_path, atlas: None, textures: Vec::new() };
-            if let Some(atlas) = atlas {
-                let atlas_path = out_dir.join(format!("{}.atlas", base));
-                std::fs::write(&atlas_path, atlas.text.as_bytes()).map_err(|e| e.to_string())?;
-                files.atlas = Some(atlas_path);
-                for (page, texture) in atlas_page_names(&atlas.text).iter().zip(&atlas.pages) {
-                    let png = out_dir.join(safe_file_name(page));
-                    if png.exists() {
-                        continue;
-                    }
-                    let result = crate::find_package(&self.packages, texture)
-                        .ok_or_else(|| format!("{} is not loaded", texture))
-                        .and_then(|pkg| crate::texture::read_texture(pkg))
-                        .and_then(|t| save_png(&png, &t.rgba, t.width as u32, t.height as u32));
-                    match result {
-                        Ok(()) => files.textures.push(png),
-                        Err(e) => errors.push(format!("{}: page {}: {}", atlas.name, page, e)),
-                    }
-                }
-            } else {
+            let ext = if skel.is_binary() { "skel" } else { "json" };
+            out.push(SpineOutput { package: key.clone(), file_name: format!("{}.{}", base, ext), data: skel.data.clone() });
+            let Some((atlas_key, atlas)) = atlas else {
                 errors.push(format!("{}: no atlas (SpineAtlasAsset) found", skel.name));
+                continue;
+            };
+            out.push(SpineOutput { package: atlas_key.clone(), file_name: format!("{}.atlas", base), data: atlas.text.as_bytes().to_vec() });
+            for (page, texture) in atlas_page_names(&atlas.text).iter().zip(&atlas.pages) {
+                let file_name = safe_file_name(page);
+                let found = crate::find_package(&self.packages, texture)
+                    .and_then(|pkg| self.packages.iter().find(|(_, p)| std::ptr::eq(*p, pkg)))
+                    .ok_or_else(|| format!("{} is not loaded", texture));
+                let result = found.and_then(|(texture_key, pkg)| {
+                    if !used_pages.insert((texture_key.clone(), file_name.to_ascii_lowercase())) {
+                        return Ok(None);
+                    }
+                    let t = crate::texture::read_texture(pkg)?;
+                    Ok(Some((texture_key.clone(), encode_png(&t.rgba, t.width as u32, t.height as u32)?)))
+                });
+                match result {
+                    Ok(Some((texture_key, data))) => out.push(SpineOutput { package: texture_key, file_name, data }),
+                    Ok(None) => {}
+                    Err(e) => errors.push(format!("{}: page {}: {}", atlas.name, page, e)),
+                }
             }
-            out.push(files);
         }
         self.errors.extend(errors);
         Ok(out)
     }
+
+    pub fn extract_spine(&mut self, out_dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+        let outputs = self.spine_outputs()?;
+        std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+        let mut written = Vec::new();
+        for o in outputs {
+            let path = out_dir.join(&o.file_name);
+            if written.contains(&path) {
+                continue;
+            }
+            std::fs::write(&path, &o.data).map_err(|e| e.to_string())?;
+            written.push(path);
+        }
+        Ok(written)
+    }
 }
 
-fn save_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> std::result::Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+fn encode_png(rgba: &[u8], width: u32, height: u32) -> std::result::Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    let mut encoder = png::Encoder::new(&mut data, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(rgba).map_err(|e| e.to_string())
+    writer.write_image_data(rgba).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(data)
 }
 
 #[cfg(test)]

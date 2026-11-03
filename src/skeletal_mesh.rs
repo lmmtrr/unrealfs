@@ -125,12 +125,15 @@ impl StripFlags {
     pub(crate) fn read(r: &mut Reader) -> Result<Self> {
         Ok(StripFlags { global: r.u8()?, class: r.u8()? })
     }
+
     pub(crate) fn editor_stripped(&self) -> bool {
         self.global & 1 != 0
     }
+
     pub(crate) fn audio_visual_stripped(&self) -> bool {
         self.global & 2 != 0
     }
+
     pub(crate) fn class_stripped(&self, flag: u8) -> bool {
         self.class & flag != 0
     }
@@ -534,7 +537,6 @@ fn read_header(pkg: &Package, r: &mut Reader, profile: Profile) -> Result<(Vec<M
     if bounds.iter().any(|v| !v.is_finite()) || bounds[6] < 0.0 {
         return Err("implausible skeletal mesh bounds".into());
     }
-
     let num_materials = r.count(8)?;
     if num_materials > 256 {
         return Err(format!("implausible material count {}", num_materials));
@@ -550,7 +552,6 @@ fn read_header(pkg: &Package, r: &mut Reader, profile: Profile) -> Result<(Vec<M
         let material = pkg.import_path(material_index).or_else(|| pkg.object_name(material_index).map(String::from));
         materials.push(MaterialSlot { slot_name, material });
     }
-
     let bones = read_reference_skeleton(pkg, r)?;
     if bones.first().is_none_or(|b| b.parent != -1) {
         return Err("skeletal mesh has no root bone".into());

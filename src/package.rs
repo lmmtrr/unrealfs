@@ -112,7 +112,6 @@ fn read_summary(r: &mut Reader, assume_soft_object_paths: bool) -> Result<Summar
     let has_ue5 = |version: i32, if_unversioned: bool| {
         is_ue5 && if unversioned { if_unversioned } else { file_version_ue5 >= version }
     };
-
     let mut header_size = 0;
     if saved_hash {
         r.skip(20)?;
@@ -178,7 +177,6 @@ fn read_summary(r: &mut Reader, assume_soft_object_paths: bool) -> Result<Summar
     }
     r.i32()?;
     let bulk_data_start_offset = r.i64()?;
-
     let mut data_resource_offset = None;
     if is_ue5 {
         r.i32()?;
@@ -203,7 +201,6 @@ fn read_summary(r: &mut Reader, assume_soft_object_paths: bool) -> Result<Summar
             data_resource_offset = Some(r.i32()?);
         }
     }
-
     Ok(Summary {
         is_ue5,
         ue5_version: file_version_ue5,

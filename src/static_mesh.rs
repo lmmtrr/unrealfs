@@ -327,7 +327,6 @@ pub fn read_static_mesh(pkg: &Package, export: &ObjectExport) -> Result<MeshData
             format!("could not read the static mesh render data ({})", first_error.unwrap_or_default())
         }
     })?;
-
     let mut materials = props.as_ref().map(|p| materials_from_properties(pkg, p)).unwrap_or_default();
     if materials.is_empty() {
         materials = [(36, 0), (44, 0), (36, 4)]
@@ -339,7 +338,6 @@ pub fn read_static_mesh(pkg: &Package, export: &ObjectExport) -> Result<MeshData
     while materials.len() < needed {
         materials.push(MaterialSlot { slot_name: format!("Material {}", materials.len() + 1), material: None });
     }
-
     let mut positions = Vec::with_capacity(geo.positions.len() * 3);
     for p in &geo.positions {
         let v = convert_vector(p[0], p[1], p[2]);
@@ -351,7 +349,6 @@ pub fn read_static_mesh(pkg: &Package, export: &ObjectExport) -> Result<MeshData
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
         normals.extend_from_slice(&[v[0] / len, v[1] / len, v[2] / len]);
     }
-
     Ok(MeshData {
         name: export.object_name.clone(),
         version: layout.label(pkg),

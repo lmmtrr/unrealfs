@@ -192,6 +192,11 @@ impl UeEnvironment {
         find_package(packages, game_path).and_then(|pkg| read_material(pkg, |p| find_package(packages, p)))
     }
 
+    pub fn package_size(&mut self, game_path: &str) -> Option<usize> {
+        self.parse_pending();
+        find_package(&self.packages, game_path).map(|pkg| pkg.uexp.len() + pkg.ubulk.as_ref().map_or(0, |b| b.len()))
+    }
+
     pub fn texture(&mut self, game_path: &str) -> Result<DecodedTexture, String> {
         self.parse_pending();
         let pkg = find_package(&self.packages, game_path).ok_or_else(|| format!("{} is not loaded", game_path))?;

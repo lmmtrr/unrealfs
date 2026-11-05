@@ -115,7 +115,8 @@ pub fn find_mappings(dir: &Path, depth: usize) -> Option<PathBuf> {
     let mut dirs = Vec::new();
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
-        if p.is_dir() {
+        let is_dir = e.file_type().is_ok_and(|t| if t.is_symlink() { p.is_dir() } else { t.is_dir() });
+        if is_dir {
             dirs.push(p);
         } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("usmap")) {
             return Some(p);

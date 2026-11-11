@@ -1,4 +1,4 @@
-use crate::package::Package;
+use crate::package::{ObjectExport, Package};
 use crate::properties::{read_object_header, PropValue, Properties};
 use serde::Serialize;
 
@@ -104,6 +104,27 @@ fn merge_instance(info: &mut MaterialInfo, pkg: &Package, props: &Properties) {
     }
 }
 
+fn enum_value(props: &Properties, key: &str) -> Option<String> {
+    match props.get(key) {
+        Some(PropValue::Name(v)) => Some(v.rsplit("::").next().unwrap_or(v).to_string()),
+        _ => None,
+    }
+}
+
+fn merge_base_material(info: &mut MaterialInfo, pkg: &Package, export: &ObjectExport) -> Option<()> {
+    let data = pkg.export_data(export).ok()?;
+    let props = read_object_header(pkg, export, &mut crate::reader::Reader::new(data)).ok()?;
+    info.blend_mode = info.blend_mode.take().or_else(|| enum_value(&props, "BlendMode"));
+    info.shading_model = info.shading_model.take().or_else(|| enum_value(&props, "ShadingModel"));
+    info.two_sided = info.two_sided.or(Some(matches!(props.get("TwoSided"), Some(PropValue::Bool(true)))).filter(|&v| v));
+    if info.opacity_mask_clip_value.is_none() {
+        if let Some(PropValue::Float(v)) = props.get("OpacityMaskClipValue") {
+            info.opacity_mask_clip_value = Some(*v);
+        }
+    }
+    Some(())
+}
+
 pub fn read_material<'a>(pkg: &'a Package, find: impl Fn(&str) -> Option<&'a Package>) -> Option<MaterialInfo> {
     let mut info = MaterialInfo::default();
     let mut current = pkg;
@@ -112,7 +133,12 @@ pub fn read_material<'a>(pkg: &'a Package, find: impl Fn(&str) -> Option<&'a Pac
             matches!(current.export_class_name(e), Some(c) if c.starts_with("MaterialInstance"))
         });
         let Some(export) = export else {
-            if depth == 0 {
+            if let Some(base) = current.exports.iter().find(|e| current.export_class_name(e) == Some("Material")) {
+                if depth == 0 {
+                    info.name = base.object_name.clone();
+                }
+                merge_base_material(&mut info, current, base);
+            } else if depth == 0 {
                 return None;
             }
             break;

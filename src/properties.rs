@@ -1,4 +1,4 @@
-use crate::package::{ObjectExport, Package};
+use crate::package::{soft_path_text, ObjectExport, Package};
 use crate::unversioned::read_unversioned_properties;
 use crate::reader::{Reader, Result};
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ pub enum PropValue {
     Color([f32; 4]),
     Struct(Properties),
     Array(Vec<PropValue>),
+    Bytes(Vec<u8>),
+    Map(Vec<(PropValue, PropValue)>),
     Other,
 }
 
@@ -51,6 +53,8 @@ struct Tag {
     struct_name: String,
     inner_type: String,
     inner_struct: Option<String>,
+    value_type: String,
+    value_struct: Option<String>,
 }
 
 const TAG_HAS_ARRAY_INDEX: u8 = 0x01;
@@ -95,6 +99,12 @@ fn read_tag(pkg: &Package, r: &mut Reader) -> Result<Option<Tag>> {
                 tag.inner_type = ty.child().to_string();
                 tag.inner_struct = ty.children.first().map(|c| c.child().to_string());
             }
+            "MapProperty" => {
+                tag.inner_type = ty.child().to_string();
+                tag.inner_struct = ty.children.first().map(|c| c.child().to_string());
+                tag.value_type = ty.children.get(1).map_or_else(String::new, |c| c.name.clone());
+                tag.value_struct = ty.children.get(1).map(|c| c.child().to_string());
+            }
             _ => {}
         }
         tag.ty = ty.name;
@@ -112,8 +122,8 @@ fn read_tag(pkg: &Package, r: &mut Reader) -> Result<Option<Tag>> {
         "ByteProperty" | "EnumProperty" => tag.enum_name = pkg.read_name(r)?,
         "ArrayProperty" | "SetProperty" | "OptionalProperty" => tag.inner_type = pkg.read_name(r)?,
         "MapProperty" => {
-            pkg.read_name(r)?;
-            pkg.read_name(r)?;
+            tag.inner_type = pkg.read_name(r)?;
+            tag.value_type = pkg.read_name(r)?;
         }
         _ => {}
     }
@@ -127,6 +137,10 @@ fn read_tag(pkg: &Package, r: &mut Reader) -> Result<Option<Tag>> {
 }
 
 pub fn read_tagged_properties(pkg: &Package, r: &mut Reader) -> Result<Properties> {
+    r.nested(|r| read_tagged_body(pkg, r))
+}
+
+fn read_tagged_body(pkg: &Package, r: &mut Reader) -> Result<Properties> {
     let mut props = Properties::new();
     while let Some(tag) = read_tag(pkg, r)? {
         let value_start = r.pos;
@@ -135,6 +149,8 @@ pub fn read_tagged_properties(pkg: &Package, r: &mut Reader) -> Result<Propertie
             "ByteProperty" if tag.size == 1 && tag.enum_name == "None" => PropValue::Int(r.u8()? as i64),
             "StructProperty" => read_struct_value(pkg, r, &tag.struct_name).unwrap_or(PropValue::Other),
             "ArrayProperty" => read_array_value(pkg, r, &tag.inner_type, tag.inner_struct.as_deref()).unwrap_or(PropValue::Other),
+            "SetProperty" => read_set_value(pkg, r, &tag.inner_type, tag.inner_struct.as_deref()).unwrap_or(PropValue::Other),
+            "MapProperty" => read_map_value(pkg, r, &tag).unwrap_or(PropValue::Other),
             _ => read_simple_value(pkg, r, &tag.ty, tag.size).unwrap_or(PropValue::Other),
         };
         r.pos = value_start;
@@ -147,40 +163,118 @@ pub fn read_tagged_properties(pkg: &Package, r: &mut Reader) -> Result<Propertie
 
 fn read_simple_value(pkg: &Package, r: &mut Reader, ty: &str, size: usize) -> Result<PropValue> {
     Ok(match ty {
+        "BoolProperty" => PropValue::Bool(r.u8()? != 0),
+        "Int8Property" => PropValue::Int(r.u8()? as i8 as i64),
+        "Int16Property" => PropValue::Int(r.i16()? as i64),
+        "UInt16Property" => PropValue::Int(r.u16()? as i64),
         "IntProperty" => PropValue::Int(r.i32()? as i64),
         "UInt32Property" => PropValue::Int(r.u32()? as i64),
+        "Int64Property" | "UInt64Property" => PropValue::Int(r.i64()?),
         "FloatProperty" => PropValue::Float(r.f32()?),
-        "ObjectProperty" | "SoftObjectProperty" if size == 4 => PropValue::Object(r.i32()?),
-        "ObjectProperty" => PropValue::Object(r.i32()?),
-        "SoftObjectProperty" | "SoftClassProperty" => PropValue::Name(read_soft_object_path(pkg, r)?),
+        "DoubleProperty" => PropValue::Float(r.f64()? as f32),
+        "ObjectProperty" | "WeakObjectProperty" | "InterfaceProperty" => PropValue::Object(r.i32()?),
+        "SoftObjectProperty" | "SoftClassProperty" | "AssetObjectProperty" => PropValue::Name(read_soft_object_path(pkg, r)?),
         "NameProperty" => PropValue::Name(pkg.read_name(r)?),
         "StrProperty" => PropValue::Name(r.fstring()?),
+        "TextProperty" => PropValue::Name(read_text(pkg, r)?),
         "ByteProperty" | "EnumProperty" if size == 8 => PropValue::Name(pkg.read_name(r)?),
         "ByteProperty" if size == 1 => PropValue::Int(r.u8()? as i64),
         _ => PropValue::Other,
     })
 }
 
-fn read_soft_object_path(pkg: &Package, r: &mut Reader) -> Result<String> {
-    let mut path = pkg.read_name(r)?;
-    if pkg.is_ue5 && pkg.ue5_version >= UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES {
-        let asset = pkg.read_name(r)?;
-        if asset != "None" {
-            path = format!("{}.{}", path, asset);
-        }
+pub(crate) fn read_soft_object_path(pkg: &Package, r: &mut Reader) -> Result<String> {
+    if pkg.soft_object_path_list {
+        let index = r.i32()?;
+        return usize::try_from(index)
+            .ok()
+            .and_then(|i| pkg.soft_object_paths.get(i).cloned())
+            .ok_or_else(|| format!("soft object path {} out of range", index));
     }
-    let sub = r.fstring()?;
-    if !sub.is_empty() {
-        path = format!("{}:{}", path, sub);
-    }
-    Ok(path)
+    let package = pkg.read_name(r)?;
+    let asset = if pkg.soft_paths_have_asset_names() { pkg.read_name(r)? } else { String::new() };
+    Ok(soft_path_text(package, asset, r.fstring()?))
 }
 
-const UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES: i32 = 1007;
+fn read_format_value(pkg: &Package, r: &mut Reader) -> Result<String> {
+    Ok(match r.u8()? {
+        0 => r.i64()?.to_string(),
+        1 => (r.i64()? as u64).to_string(),
+        2 => r.f32()?.to_string(),
+        3 => r.f64()?.to_string(),
+        4 => read_text(pkg, r)?,
+        5 => r.u8()?.to_string(),
+        kind => return Err(format!("unsupported FText argument type {}", kind)),
+    })
+}
+
+fn read_number_text(pkg: &Package, r: &mut Reader) -> Result<String> {
+    let value = read_format_value(pkg, r)?;
+    if r.bool32()? {
+        r.skip(FORMATTING_OPTIONS_SIZE)?;
+    }
+    r.fstring()?;
+    Ok(value)
+}
+
+pub(crate) fn read_text(pkg: &Package, r: &mut Reader) -> Result<String> {
+    r.nested(|r| {
+        r.u32()?;
+        let history = r.u8()? as i8;
+        match history {
+            -1 => Ok(if r.bool32()? { r.fstring()? } else { String::new() }),
+            0 => {
+                r.fstring()?;
+                r.fstring()?;
+                r.fstring()
+            }
+            1 => {
+                let format = read_text(pkg, r)?;
+                for _ in 0..r.count(5)? {
+                    r.fstring()?;
+                    read_format_value(pkg, r)?;
+                }
+                Ok(format)
+            }
+            2 => {
+                let format = read_text(pkg, r)?;
+                for _ in 0..r.count(1)? {
+                    read_format_value(pkg, r)?;
+                }
+                Ok(format)
+            }
+            3 => {
+                let format = read_text(pkg, r)?;
+                for _ in 0..r.count(5)? {
+                    r.fstring()?;
+                    read_format_value(pkg, r)?;
+                }
+                Ok(format)
+            }
+            4 | 5 => read_number_text(pkg, r),
+            6 => {
+                r.fstring()?;
+                read_number_text(pkg, r)
+            }
+            10 => {
+                let text = read_text(pkg, r)?;
+                r.u8()?;
+                Ok(text)
+            }
+            11 => {
+                pkg.read_name(r)?;
+                r.fstring()
+            }
+            _ => Err(format!("unsupported FText history type {}", history)),
+        }
+    })
+}
+
+const FORMATTING_OPTIONS_SIZE: usize = 25;
 
 fn read_real(pkg: &Package, r: &mut Reader) -> Result<f32> {
     if pkg.large_world_coordinates() {
-        Ok(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap()) as f32)
+        Ok(r.f64()? as f32)
     } else {
         r.f32()
     }
@@ -189,10 +283,11 @@ fn read_real(pkg: &Package, r: &mut Reader) -> Result<f32> {
 fn read_struct_value(pkg: &Package, r: &mut Reader, struct_name: &str) -> Result<PropValue> {
     Ok(match struct_name {
         "Vector" | "Rotator" => PropValue::Vector([read_real(pkg, r)?, read_real(pkg, r)?, read_real(pkg, r)?]),
-        "Vector4" | "Quat" => {
+        "Vector3f" | "Rotator3f" => PropValue::Vector([r.f32()?, r.f32()?, r.f32()?]),
+        "Vector4" | "Quat" | "Plane" => {
             PropValue::Color([read_real(pkg, r)?, read_real(pkg, r)?, read_real(pkg, r)?, read_real(pkg, r)?])
         }
-        "LinearColor" => PropValue::Color([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
+        "LinearColor" | "Vector4f" | "Quat4f" | "Plane4f" => PropValue::Color([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
         "Color" => {
             let b = r.bytes(4)?;
             PropValue::Color([b[2] as f32 / 255.0, b[1] as f32 / 255.0, b[0] as f32 / 255.0, b[3] as f32 / 255.0])
@@ -206,37 +301,66 @@ fn read_struct_value(pkg: &Package, r: &mut Reader, struct_name: &str) -> Result
 
 fn read_array_value(pkg: &Package, r: &mut Reader, inner_type: &str, inner_struct: Option<&str>) -> Result<PropValue> {
     let count = r.count(1)?;
+    if inner_type == "ByteProperty" {
+        return Ok(PropValue::Bytes(r.bytes(count)?.to_vec()));
+    }
     let mut items = Vec::with_capacity(count);
     if inner_type == "StructProperty" {
         let struct_name = match inner_struct {
             Some(name) if pkg.complete_type_names() => name.to_string(),
-            _ => {
-                pkg.read_name(r)?;
-                pkg.read_name(r)?;
-                r.i32()?;
-                r.i32()?;
-                let struct_name = pkg.read_name(r)?;
-                r.skip(16)?;
-                if r.u8()? != 0 {
-                    r.skip(16)?;
-                }
-                struct_name
-            }
+            _ => read_tag(pkg, r)?.ok_or("array of structs has no inner tag")?.struct_name,
         };
         for _ in 0..count {
             items.push(read_struct_value(pkg, r, &struct_name)?);
         }
     } else {
-        let size = match inner_type {
-            "ByteProperty" => 1,
-            "NameProperty" => 8,
-            _ => 4,
-        };
         for _ in 0..count {
-            items.push(read_simple_value(pkg, r, inner_type, size)?);
+            items.push(read_element(pkg, r, inner_type, None)?);
         }
     }
     Ok(PropValue::Array(items))
+}
+
+fn read_element(pkg: &Package, r: &mut Reader, ty: &str, struct_name: Option<&str>) -> Result<PropValue> {
+    if ty == "StructProperty" {
+        return read_struct_value(pkg, r, struct_name.unwrap_or_default());
+    }
+    let size = match ty {
+        "ByteProperty" => 1,
+        "NameProperty" | "EnumProperty" => 8,
+        _ => 4,
+    };
+    read_simple_value(pkg, r, ty, size)
+}
+
+fn read_known_element(pkg: &Package, r: &mut Reader, ty: &str, struct_name: Option<&str>) -> Result<PropValue> {
+    match read_element(pkg, r, ty, struct_name)? {
+        PropValue::Other => Err(format!("unsupported container element {}", ty)),
+        value => Ok(value),
+    }
+}
+
+fn read_set_value(pkg: &Package, r: &mut Reader, inner_type: &str, inner_struct: Option<&str>) -> Result<PropValue> {
+    for _ in 0..r.count(1)? {
+        read_known_element(pkg, r, inner_type, inner_struct)?;
+    }
+    let count = r.count(1)?;
+    (0..count).map(|_| read_known_element(pkg, r, inner_type, inner_struct)).collect::<Result<_>>().map(PropValue::Array)
+}
+
+fn read_map_value(pkg: &Package, r: &mut Reader, tag: &Tag) -> Result<PropValue> {
+    let key_struct = tag.inner_struct.as_deref();
+    for _ in 0..r.count(1)? {
+        read_known_element(pkg, r, &tag.inner_type, key_struct)?;
+    }
+    let count = r.count(1)?;
+    (0..count)
+        .map(|_| {
+            let key = read_known_element(pkg, r, &tag.inner_type, key_struct)?;
+            Ok((key, read_known_element(pkg, r, &tag.value_type, tag.value_struct.as_deref())?))
+        })
+        .collect::<Result<_>>()
+        .map(PropValue::Map)
 }
 
 pub fn read_object_header(pkg: &Package, export: &ObjectExport, r: &mut Reader) -> Result<Properties> {

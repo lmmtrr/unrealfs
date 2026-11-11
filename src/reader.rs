@@ -1,13 +1,26 @@
 pub type Result<T> = std::result::Result<T, String>;
 
+const MAX_NESTING: usize = 64;
+
 pub struct Reader<'a> {
     pub data: &'a [u8],
     pub pos: usize,
+    depth: usize,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Reader { data, pos: 0 }
+        Reader { data, pos: 0, depth: 0 }
+    }
+
+    pub fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.depth >= MAX_NESTING {
+            return Err(format!("data is nested too deeply at {}", self.pos));
+        }
+        self.depth += 1;
+        let result = read(self);
+        self.depth -= 1;
+        result
     }
 
     pub fn remaining(&self) -> usize {
@@ -15,15 +28,14 @@ impl<'a> Reader<'a> {
     }
 
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        if n > self.remaining() {
+        let Some(s) = self.pos.checked_add(n).and_then(|end| self.data.get(self.pos..end)) else {
             return Err(format!(
                 "read of {} bytes at {} exceeds length {}",
                 n,
                 self.pos,
                 self.data.len()
             ));
-        }
-        let s = &self.data[self.pos..self.pos + n];
+        };
         self.pos += n;
         Ok(s)
     }
@@ -58,6 +70,10 @@ impl<'a> Reader<'a> {
 
     pub fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
     pub fn bool32(&mut self) -> Result<bool> {

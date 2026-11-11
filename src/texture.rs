@@ -3,6 +3,10 @@ use crate::package::Package;
 use crate::properties::read_object_header;
 use crate::reader::{Reader, Result};
 
+const TEXTURE_2D: &str = "Texture2D";
+const TEXTURE_CUBE: &str = "TextureCube";
+const TEXTURE_ARRAY: &str = "Texture2DArray";
+
 pub struct DecodedTexture {
     pub width: usize,
     pub height: usize,
@@ -23,9 +27,20 @@ fn decode_blocks(
     block_bytes: usize,
     decode: impl Fn(&[u8], usize, usize, &mut [u32]) -> std::result::Result<(), &'static str>,
 ) -> Result<Vec<u8>> {
-    let aw = width.div_ceil(4) * 4;
-    let ah = height.div_ceil(4) * 4;
-    let needed = (aw / 4) * (ah / 4) * block_bytes;
+    decode_sized_blocks(data, width, height, (4, 4), block_bytes, decode)
+}
+
+fn decode_sized_blocks(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    block: (usize, usize),
+    block_bytes: usize,
+    decode: impl Fn(&[u8], usize, usize, &mut [u32]) -> std::result::Result<(), &'static str>,
+) -> Result<Vec<u8>> {
+    let aw = width.div_ceil(block.0) * block.0;
+    let ah = height.div_ceil(block.1) * block.1;
+    let needed = (aw / block.0) * (ah / block.1) * block_bytes;
     if data.len() < needed {
         return Err(format!("texture data too short ({} < {})", data.len(), needed));
     }
@@ -56,12 +71,113 @@ fn unit_to_u8(v: f32) -> u8 {
     (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-fn decode_pixels(format: &str, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-    let pixels = width * height;
-    let raw = |bpp: usize| -> Result<&[u8]> {
-        data.get(..pixels * bpp).ok_or_else(|| "texture data too short".to_string())
+fn astc_block_size(format: &str) -> Option<(usize, usize)> {
+    let size = format.strip_prefix("PF_ASTC_")?.trim_end_matches("_HDR").trim_end_matches("_UNORM");
+    let (w, h) = size.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+fn unorm16(c: &[u8]) -> u8 {
+    c[1]
+}
+
+fn decode_r11g11b10(c: &[u8]) -> [u8; 4] {
+    let packed = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    let small_float = |bits: u32, mantissa_bits: u32| {
+        let exponent = bits >> mantissa_bits;
+        let mantissa = (bits & ((1 << mantissa_bits) - 1)) as f32 / (1u32 << mantissa_bits) as f32;
+        match exponent {
+            0 => mantissa * 2f32.powi(-14),
+            _ => (1.0 + mantissa) * 2f32.powi(exponent as i32 - 15),
+        }
     };
+    [
+        unit_to_u8(small_float(packed & 0x7ff, 6)),
+        unit_to_u8(small_float((packed >> 11) & 0x7ff, 6)),
+        unit_to_u8(small_float(packed >> 22, 5)),
+        255,
+    ]
+}
+
+fn decode_pixels(format: &str, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    let pixels = width.checked_mul(height).ok_or("texture is too large")?;
+    let raw = |bpp: usize| -> Result<&[u8]> {
+        pixels.checked_mul(bpp).and_then(|n| data.get(..n)).ok_or_else(|| "texture data too short".to_string())
+    };
+    if let Some(block) = astc_block_size(format) {
+        return decode_sized_blocks(data, width, height, block, 16, |d, w, h, out| texture2ddecoder::decode_astc(d, w, h, block.0, block.1, out));
+    }
     match format {
+        "PF_ETC1" => decode_blocks(data, width, height, 8, texture2ddecoder::decode_etc1),
+        "PF_ETC2_RGB" => decode_blocks(data, width, height, 8, texture2ddecoder::decode_etc2_rgb),
+        "PF_ETC2_RGBA" => decode_blocks(data, width, height, 16, texture2ddecoder::decode_etc2_rgba8),
+        "PF_ETC2_R11_EAC" => decode_blocks(data, width, height, 8, texture2ddecoder::decode_eacr),
+        "PF_ETC2_RG11_EAC" => decode_blocks(data, width, height, 16, texture2ddecoder::decode_eacrg),
+        "PF_ATC_RGB" => decode_blocks(data, width, height, 8, texture2ddecoder::decode_atc_rgb4),
+        "PF_ATC_RGBA_E" | "PF_ATC_RGBA_I" => decode_blocks(data, width, height, 16, texture2ddecoder::decode_atc_rgba8),
+        "PF_PVRTC2" | "PF_PVRTC4" => {
+            let two_bpp = format == "PF_PVRTC2";
+            let needed = width.div_ceil(if two_bpp { 8 } else { 4 }) * height.div_ceil(4) * 8;
+            let bytes = data.get(..needed).ok_or("texture data too short")?;
+            let mut out = vec![0u32; pixels];
+            texture2ddecoder::decode_pvrtc(bytes, width, height, &mut out, two_bpp).map_err(|e| e.to_string())?;
+            Ok(out.iter().flat_map(|p| {
+                let [b, g, r, a] = p.to_le_bytes();
+                [r, g, b, a]
+            }).collect())
+        }
+        "PF_R8" | "PF_R8_UINT" => Ok(raw(1)?.iter().flat_map(|&v| [v, v, v, 255]).collect()),
+        "PF_R8G8" | "PF_V8U8" => Ok(raw(2)?.chunks_exact(2).flat_map(|c| [c[0], c[1], 0, 255]).collect()),
+        "PF_R8G8B8A8_UINT" | "PF_R8G8B8A8_SNORM" => Ok(raw(4)?.to_vec()),
+        "PF_R5G6B5_UNORM" => Ok(raw(2)?
+            .chunks_exact(2)
+            .flat_map(|c| {
+                let v = u16::from_le_bytes([c[0], c[1]]);
+                let (r, g, b) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
+                [(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8, 255]
+            })
+            .collect()),
+        "PF_B5G5R5A1_UNORM" => Ok(raw(2)?
+            .chunks_exact(2)
+            .flat_map(|c| {
+                let v = u16::from_le_bytes([c[0], c[1]]);
+                let channel = |shift: u16| (((v >> shift) & 31) * 255 / 31) as u8;
+                [channel(10), channel(5), channel(0), if v >> 15 != 0 { 255 } else { 0 }]
+            })
+            .collect()),
+        "PF_A2B10G10R10" => Ok(raw(4)?
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let channel = |shift: u32| (((v >> shift) & 1023) >> 2) as u8;
+                [channel(0), channel(10), channel(20), ((v >> 30) * 85) as u8]
+            })
+            .collect()),
+        "PF_A16B16G16R16" | "PF_R16G16B16A16_UNORM" | "PF_R16G16B16A16_UINT" => Ok(raw(8)?.chunks_exact(2).map(unorm16).collect()),
+        "PF_G16R16" | "PF_R16G16_UINT" => Ok(raw(4)?.chunks_exact(4).flat_map(|c| [c[1], c[3], 0, 255]).collect()),
+        "PF_R16_UINT" | "PF_R16_SINT" => Ok(raw(2)?.chunks_exact(2).flat_map(|c| [c[1], c[1], c[1], 255]).collect()),
+        "PF_G16R16F" | "PF_G16R16F_FILTER" => Ok(raw(4)?
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let channel = |i: usize| unit_to_u8(f16_to_f32(u16::from_le_bytes([c[i], c[i + 1]])));
+                [channel(0), channel(2), 0, 255]
+            })
+            .collect()),
+        "PF_G32R32F" => Ok(raw(8)?
+            .chunks_exact(8)
+            .flat_map(|c| {
+                let channel = |i: usize| unit_to_u8(f32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]));
+                [channel(0), channel(4), 0, 255]
+            })
+            .collect()),
+        "PF_R32G32B32F" => Ok(raw(12)?
+            .chunks_exact(12)
+            .flat_map(|c| {
+                let channel = |i: usize| unit_to_u8(f32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]));
+                [channel(0), channel(4), channel(8), 255]
+            })
+            .collect()),
+        "PF_FloatRGB" | "PF_FloatR11G11B10" => Ok(raw(4)?.chunks_exact(4).flat_map(decode_r11g11b10).collect()),
         "PF_DXT1" => decode_blocks(data, width, height, 8, texture2ddecoder::decode_bc1),
         "PF_DXT3" => decode_blocks(data, width, height, 16, texture2ddecoder::decode_bc2),
         "PF_DXT5" => decode_blocks(data, width, height, 16, texture2ddecoder::decode_bc3),
@@ -113,8 +229,8 @@ pub fn read_texture(pkg: &Package) -> Result<DecodedTexture> {
     let export = pkg
         .exports
         .iter()
-        .find(|e| pkg.export_class_name(e) == Some("Texture2D"))
-        .ok_or("package has no Texture2D export")?;
+        .find(|e| matches!(pkg.export_class_name(e), Some(TEXTURE_2D | TEXTURE_CUBE | TEXTURE_ARRAY)))
+        .ok_or("package has no texture export")?;
     let data = pkg.export_data(export)?;
     let mut r = Reader::new(data);
     read_object_header(pkg, export, &mut r)?;
@@ -162,10 +278,15 @@ pub fn read_texture(pkg: &Package) -> Result<DecodedTexture> {
         }
         mips.push(Mip { width: width as usize, height: height as usize, data: payload });
     }
+    if mips.is_empty() {
+        return Err("texture has no mips (virtual textures are not supported)".into());
+    }
     let mip = mips
         .iter()
         .find(|m| m.data.is_some())
         .ok_or("no mip data available (is the .ubulk file missing?)")?;
-    let rgba = decode_pixels(&format, mip.data.unwrap(), mip.width, mip.height)?;
+    let slices = if packed >> 31 != 0 { 6 } else { (packed & 0x3fff_ffff).max(1) as usize };
+    let data = mip.data.unwrap();
+    let rgba = decode_pixels(&format, &data[..data.len() / slices], mip.width, mip.height)?;
     Ok(DecodedTexture { width: mip.width, height: mip.height, format, rgba })
 }

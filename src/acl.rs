@@ -12,6 +12,8 @@ const SUB_TRACK_CONSTANT: u32 = 1;
 const SUB_TRACK_ANIMATED: u32 = 2;
 const TRANSFORM_HEADER: usize = 32;
 const TRANSFORM_HEADER_SIZE: usize = 52;
+const MAX_SAMPLES: usize = 1 << 24;
+const MAX_TRACK_SAMPLES: usize = 1 << 28;
 
 pub struct AclTrack {
     pub rotation: Option<Vec<[f32; 4]>>,
@@ -54,6 +56,9 @@ impl Data<'_> {
         if num_bits == 0 {
             return Ok(0);
         }
+        if num_bits > 32 {
+            return Err(format!("invalid ACL bit width {}", num_bits));
+        }
         let start = bit_offset / 8;
         let end = (bit_offset + num_bits as usize).div_ceil(8);
         if end > self.0.len() {
@@ -67,8 +72,15 @@ impl Data<'_> {
     }
 
     fn unorm(&self, bit_offset: usize, num_bits: u32) -> Result<f32> {
-        Ok(self.bits(bit_offset, num_bits)? as f32 / ((1u32 << num_bits) - 1) as f32)
+        Ok(self.bits(bit_offset, num_bits)? as f32 / ((1u64 << num_bits) - 1) as f32)
     }
+}
+
+fn check_counts(bytes: &[u8], num_tracks: usize, num_samples: usize) -> Result<()> {
+    if num_tracks > bytes.len() || num_samples > MAX_SAMPLES || num_tracks.saturating_mul(num_samples) > MAX_TRACK_SAMPLES {
+        return Err(format!("implausible ACL size ({} tracks, {} samples)", num_tracks, num_samples));
+    }
+    Ok(())
 }
 
 fn quat_from_positive_w(v: [f32; 3]) -> [f32; 4] {
@@ -267,6 +279,7 @@ pub fn decode_scalar_tracks(bytes: &[u8]) -> Result<AclCurves> {
     }
     let num_tracks = d.u32(16)? as usize;
     let num_samples = d.u32(20)? as usize;
+    check_counts(bytes, num_tracks, num_samples)?;
     let sample_rate = d.f32(24)?;
     let wrap = version > VERSION_FIRST && d.u32(28)? & (1 << 30) != 0;
     let h = SCALAR_HEADER;
@@ -336,6 +349,7 @@ pub fn decode_transform_tracks(bytes: &[u8]) -> Result<AclClip> {
     }
     let num_tracks = d.u32(16)? as usize;
     let num_samples = d.u32(20)? as usize;
+    check_counts(bytes, num_tracks, num_samples)?;
     let sample_rate = d.f32(24)?;
     let misc = d.u32(28)?;
     if misc & (1 << 8) != 0 {
@@ -367,7 +381,7 @@ pub fn decode_transform_tracks(bytes: &[u8]) -> Result<AclClip> {
     let sub_track_types = t + at(10)?;
     let constant_data = t + at(11)?;
     let num_variable = at(1)?;
-    let mut segments = Vec::with_capacity(num_segments);
+    let mut segments = Vec::with_capacity(num_segments.min(bytes.len()));
     let header_size = if has_stripped_keyframes { 20 } else { 16 };
     for s in 0..num_segments {
         let h = segment_headers + s * header_size;
@@ -445,6 +459,9 @@ pub fn decode_transform_tracks(bytes: &[u8]) -> Result<AclClip> {
             }
             SUB_TRACK_ANIMATED => {
                 let i = animated[0];
+                if i >= layout.num_rotations {
+                    return Err("ACL sub-track counts do not match the header".into());
+                }
                 animated[0] += 1;
                 Some((0..num_out).map(|f| {
                     let (a, b, t) = keyframe_at(source_frame(f));
@@ -462,6 +479,9 @@ pub fn decode_transform_tracks(bytes: &[u8]) -> Result<AclClip> {
                 }
                 SUB_TRACK_ANIMATED => {
                     let i = animated[kind];
+                    if i >= if kind == 1 { layout.num_translations } else { layout.num_scales } {
+                        return Err("ACL sub-track counts do not match the header".into());
+                    }
                     animated[kind] += 1;
                     Some((0..num_out).map(|f| {
                         let (a, b, t) = keyframe_at(source_frame(f));

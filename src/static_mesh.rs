@@ -9,6 +9,7 @@ use crate::skeletal_mesh::{
 
 const MAX_LODS: usize = 8;
 const CDSF_MIN_LOD_DATA: u8 = 2;
+const LOD_RESYNC_WINDOW: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -130,7 +131,13 @@ fn read_buffers(r: &mut Reader, layout: Layout) -> Result<Geometry> {
     Ok(Geometry { positions, normals, uvs, indices })
 }
 
-fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, layout: Layout) -> Result<Option<(Vec<StaticSection>, Geometry)>> {
+enum LodRead {
+    Geometry(Vec<StaticSection>, Geometry),
+    Empty,
+    Unavailable(String),
+}
+
+fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, layout: Layout) -> Result<LodRead> {
     let strip = StripFlags::read(r)?;
     let num_sections = r.count(28)?;
     if num_sections == 0 {
@@ -143,20 +150,21 @@ fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, layout: Layout) -> Result<
         if strip.audio_visual_stripped() || strip.class_stripped(CDSF_MIN_LOD_DATA) {
             return Err("LOD buffers are stripped".into());
         }
-        return Ok(Some((sections, read_buffers(r, layout)?)));
+        return Ok(LodRead::Geometry(sections, read_buffers(r, layout)?));
     }
     let cooked_out = r.bool32()?;
     let inlined = r.bool32()?;
     r.skip(layout.buffer_gap)?;
     if strip.audio_visual_stripped() || cooked_out {
-        return Ok(None);
+        return Ok(LodRead::Empty);
     }
     if inlined {
-        return Ok(Some((sections, read_buffers(r, layout)?)));
+        return Ok(LodRead::Geometry(sections, read_buffers(r, layout)?));
     }
-    match read_bulk_data(pkg, r)? {
-        Some(payload) => Ok(Some((sections, read_buffers(&mut Reader::new(payload), layout)?))),
-        None => Err("streamed LOD has no data".into()),
+    match read_bulk_data(pkg, r) {
+        Ok(Some(payload)) => Ok(LodRead::Geometry(sections, read_buffers(&mut Reader::new(payload), layout)?)),
+        Ok(None) => Err("streamed LOD has no data".into()),
+        Err(e) => Ok(LodRead::Unavailable(e)),
     }
 }
 
@@ -172,7 +180,7 @@ fn validate(sections: &[StaticSection], geo: &Geometry) -> Result<()> {
         return Err("index buffer out of range".into());
     }
     for s in sections {
-        if (s.first_index + s.num_triangles * 3) as usize > geo.indices.len() || s.max_vertex as usize >= n {
+        if s.first_index as u64 + s.num_triangles as u64 * 3 > geo.indices.len() as u64 || s.max_vertex as usize >= n {
             return Err("section range out of bounds".into());
         }
     }
@@ -189,9 +197,23 @@ fn read_render_data<'a>(
         return Err(format!("implausible LOD count {}", num_lods));
     }
     for index in 0..num_lods {
-        if let Some((sections, geo)) = read_lod(pkg, r, layout)? {
-            validate(&sections, &geo)?;
-            return Ok((sections, geo, index));
+        match read_lod(pkg, r, layout)? {
+            LodRead::Geometry(sections, geo) => {
+                validate(&sections, &geo)?;
+                return Ok((sections, geo, index));
+            }
+            LodRead::Empty => {}
+            LodRead::Unavailable(e) => {
+                let after = r.pos;
+                let next = (0..LOD_RESYNC_WINDOW).filter(|_| index + 1 < num_lods).find_map(|skip| {
+                    r.pos = after + skip;
+                    match read_lod(pkg, r, layout) {
+                        Ok(LodRead::Geometry(sections, geo)) if validate(&sections, &geo).is_ok() => Some((sections, geo, index + 1)),
+                        _ => None,
+                    }
+                });
+                return next.ok_or(e);
+            }
         }
     }
     Err("no LOD with geometry found".into())

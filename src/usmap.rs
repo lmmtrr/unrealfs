@@ -7,6 +7,7 @@ const VERSION_PACKAGE_VERSIONING: u8 = 1;
 const VERSION_LONG_FNAME: u8 = 2;
 const VERSION_LARGE_ENUMS: u8 = 3;
 const VERSION_EXPLICIT_ENUM_VALUES: u8 = 4;
+const MAX_TYPE_DEPTH: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum PropType {
@@ -62,6 +63,7 @@ pub struct StructSchema {
 pub struct Mappings {
     pub structs: HashMap<String, StructSchema>,
     pub enums: HashMap<String, Vec<(i64, String)>>,
+    pub package_version: Option<(i32, i32)>,
 }
 
 impl Mappings {
@@ -74,8 +76,9 @@ impl Mappings {
         if version > VERSION_EXPLICIT_ENUM_VALUES {
             return Err(format!("unsupported .usmap version {}", version));
         }
+        let mut package_version = None;
         if version >= VERSION_PACKAGE_VERSIONING && r.bool32()? {
-            r.skip(8)?;
+            package_version = Some((r.i32()?, r.i32()?));
             let custom_versions = r.count(20)?;
             r.skip(custom_versions * 20 + 4)?;
         }
@@ -85,22 +88,30 @@ impl Mappings {
         let payload = r.bytes(compressed_size)?;
         let body = match method {
             0 => payload.to_vec(),
+            2 => {
+                let mut out = Vec::new();
+                brotli_decompressor::Decompressor::new(payload, 4096)
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("invalid Brotli data in .usmap: {}", e))?;
+                out
+            }
             3 => {
-                let mut out = Vec::with_capacity(size);
+                let mut out = Vec::new();
                 ruzstd::decoding::StreamingDecoder::new(payload)
                     .map_err(|e| format!("invalid ZStandard data in .usmap: {}", e))?
                     .read_to_end(&mut out)
                     .map_err(|e| format!("invalid ZStandard data in .usmap: {}", e))?;
                 out
             }
-            1 => return Err("Oodle-compressed .usmap files are not supported; export it uncompressed or with ZStandard".into()),
-            2 => return Err("Brotli-compressed .usmap files are not supported; export it uncompressed or with ZStandard".into()),
+            1 => return Err("Oodle-compressed .usmap files are not supported; export it uncompressed, with Brotli or with ZStandard".into()),
             m => return Err(format!("unknown .usmap compression method {}", m)),
         };
         if body.len() != size {
             return Err(format!(".usmap payload is {} bytes, expected {}", body.len(), size));
         }
-        Body { r: Reader::new(&body), version, names: Vec::new() }.read()
+        let mut mappings = Body { r: Reader::new(&body), version, names: Vec::new(), depth: 0 }.read()?;
+        mappings.package_version = package_version;
+        Ok(mappings)
     }
 
     pub fn find(&self, name: &str) -> Option<&StructSchema> {
@@ -121,6 +132,9 @@ impl Mappings {
                 }
                 break;
             };
+            if chain.len() > self.structs.len() {
+                return None;
+            }
             chain.push(schema);
             current = schema.super_name.as_deref();
         }
@@ -142,6 +156,7 @@ struct Body<'a> {
     r: Reader<'a>,
     version: u8,
     names: Vec<String>,
+    depth: usize,
 }
 
 impl Body<'_> {
@@ -154,6 +169,16 @@ impl Body<'_> {
     }
 
     fn prop_type(&mut self) -> Result<PropType> {
+        if self.depth >= MAX_TYPE_DEPTH {
+            return Err("property type is nested too deeply in the .usmap".into());
+        }
+        self.depth += 1;
+        let result = self.prop_type_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn prop_type_inner(&mut self) -> Result<PropType> {
         let id = self.r.u8()?;
         Ok(match id {
             0 => PropType::Byte,

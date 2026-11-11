@@ -32,6 +32,7 @@ struct PackageFiles {
     uasset: Option<Vec<u8>>,
     uexp: Option<Vec<u8>>,
     ubulk: Option<Vec<u8>>,
+    uptnl: Option<Vec<u8>>,
 }
 
 #[derive(Serialize)]
@@ -53,7 +54,7 @@ pub struct AnimEntry {
 fn split_package_path(path: &str) -> Option<(String, &'static str)> {
     let normalized = path.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
-    for ext in ["uasset", "uexp", "ubulk"] {
+    for ext in ["uasset", "umap", "uexp", "ubulk", "uptnl"] {
         if lower.ends_with(&format!(".{}", ext)) {
             let stem = &normalized[..normalized.len() - ext.len() - 1];
             return Some((stem.to_string(), ext));
@@ -81,7 +82,7 @@ fn find_package<'a>(packages: &'a BTreeMap<String, Package>, game_path: &str) ->
         .map(|(_, pkg)| pkg)
 }
 
-fn is_mappings_file(path: &str) -> bool {
+pub fn is_mappings_file(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".usmap")
 }
 
@@ -91,7 +92,7 @@ pub fn is_unreal_file(path: &str) -> bool {
 
 pub fn package_files(uasset: &Path) -> Vec<PathBuf> {
     let mut out = vec![uasset.to_path_buf()];
-    for ext in ["uexp", "ubulk"] {
+    for ext in ["uexp", "ubulk", "uptnl"] {
         let p = uasset.with_extension(ext);
         if p.is_file() {
             out.push(p);
@@ -152,8 +153,9 @@ impl UeEnvironment {
         };
         let entry = self.pending.entry(key).or_default();
         match ext {
-            "uasset" => entry.uasset = Some(data),
+            "uasset" | "umap" => entry.uasset = Some(data),
             "uexp" => entry.uexp = Some(data),
+            "uptnl" => entry.uptnl = Some(data),
             _ => entry.ubulk = Some(data),
         }
         true
@@ -163,14 +165,19 @@ impl UeEnvironment {
         let keys: Vec<String> = self
             .pending
             .iter()
-            .filter(|(_, f)| f.uasset.is_some() && f.uexp.is_some())
+            .filter(|(_, f)| f.uexp.is_some() && f.uasset.is_some() || f.uasset.as_deref().is_some_and(Package::has_embedded_exports))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys {
             let files = self.pending.remove(&key).unwrap();
             let uasset = files.uasset.unwrap();
-            match Package::parse(&key, &uasset, files.uexp.unwrap(), files.ubulk) {
+            let parsed = match files.uexp {
+                Some(uexp) => Package::parse(&key, &uasset, uexp, files.ubulk),
+                None => Package::parse_embedded(&key, &uasset, files.ubulk),
+            };
+            match parsed {
                 Ok(mut pkg) => {
+                    pkg.uptnl = files.uptnl;
                     pkg.mappings = self.mappings.clone();
                     self.packages.insert(key, pkg);
                 }

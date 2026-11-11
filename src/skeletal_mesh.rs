@@ -112,6 +112,8 @@ pub struct MeshData {
 
 pub const UNIT_SCALE: f32 = 0.01;
 
+const LOD_RESYNC_WINDOW: usize = 1024;
+
 pub fn convert_vector(x: f32, y: f32, z: f32) -> [f32; 3] {
     [y, z, x]
 }
@@ -326,7 +328,7 @@ fn read_skin_weights(r: &mut Reader, profile: Profile) -> Result<Vec<Vec<(u16, u
         }
         Ok(out)
     };
-    let mut influences = Vec::with_capacity(num_vertices);
+    let mut influences = Vec::with_capacity(num_vertices.min(data.len()));
     if variable_influences {
         if lookup.len() != num_vertices {
             return Err("skin weight lookup does not match vertex count".into());
@@ -409,14 +411,20 @@ fn read_streamed_data(r: &mut Reader, profile: Profile) -> Result<Geometry> {
     Ok(Geometry { indices, positions, normals, uvs, influences })
 }
 
-fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, profile: Profile) -> Result<Option<(Vec<RenderSection>, Geometry)>> {
+enum LodRead {
+    Geometry(Vec<RenderSection>, Geometry),
+    Empty,
+    Unavailable(String),
+}
+
+fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, profile: Profile) -> Result<LodRead> {
     let strip = StripFlags::read(r)?;
     let cooked_out = r.bool32()?;
     let inlined = r.bool32()?;
     let required_bones = r.count(2)?;
     r.skip(required_bones * 2)?;
     if strip.audio_visual_stripped() || cooked_out {
-        return Ok(None);
+        return Ok(LodRead::Empty);
     }
     let sections = read_sections(r, profile)?;
     let active_bones = r.count(2)?;
@@ -434,15 +442,16 @@ fn read_lod<'a>(pkg: &'a Package, r: &mut Reader<'a>, profile: Profile) -> Resul
         r.pos = start;
         read_streamed_data(r, profile)?
     } else {
-        match read_bulk_data(pkg, r)? {
-            Some(payload) => read_streamed_data(&mut Reader::new(payload), profile)?,
-            None => return Ok(None),
+        match read_bulk_data(pkg, r) {
+            Ok(Some(payload)) => read_streamed_data(&mut Reader::new(payload), profile)?,
+            Ok(None) => return Ok(LodRead::Empty),
+            Err(e) => return Ok(LodRead::Unavailable(e)),
         }
     };
-    Ok(Some((sections, geometry)))
+    Ok(LodRead::Geometry(sections, geometry))
 }
 
-fn read_lod_legacy(r: &mut Reader, profile: Profile) -> Result<Option<(Vec<RenderSection>, Geometry)>> {
+fn read_lod_legacy(r: &mut Reader, profile: Profile) -> Result<LodRead> {
     let strip = StripFlags::read(r)?;
     let sections = read_sections(r, profile)?;
     let indices = read_index_buffer(r)?;
@@ -451,10 +460,10 @@ fn read_lod_legacy(r: &mut Reader, profile: Profile) -> Result<Option<(Vec<Rende
     let required_bones = r.count(2)?;
     r.skip(required_bones * 2)?;
     if strip.audio_visual_stripped() || strip.class_stripped(2) {
-        return Ok(None);
+        return Ok(LodRead::Empty);
     }
     let (positions, normals, uvs, influences) = read_vertex_streams(r, profile)?;
-    Ok(Some((sections, Geometry { indices, positions, normals, uvs, influences })))
+    Ok(LodRead::Geometry(sections, Geometry { indices, positions, normals, uvs, influences }))
 }
 
 fn validate(sections: &[RenderSection], geo: &Geometry, num_bones: usize, num_materials: usize) -> Result<()> {
@@ -472,8 +481,8 @@ fn validate(sections: &[RenderSection], geo: &Geometry, num_bones: usize, num_ma
         if s.material_index < 0 || (num_materials > 0 && s.material_index as usize >= num_materials) {
             return Err(format!("section material index {} out of range", s.material_index));
         }
-        if (s.base_index + s.num_triangles * 3) as usize > geo.indices.len()
-            || (s.base_vertex_index + s.num_vertices) as usize > n
+        if s.base_index as u64 + s.num_triangles as u64 * 3 > geo.indices.len() as u64
+            || s.base_vertex_index as u64 + s.num_vertices as u64 > n as u64
         {
             return Err("section range out of bounds".into());
         }
@@ -592,19 +601,38 @@ pub fn read_skeletal_mesh(pkg: &Package, export: &ObjectExport, profile: Profile
     let num_lods = r.count(8)?;
     let mut found = None;
     let mut lod_index = 0;
+    let mut unavailable = None;
     for index in 0..num_lods {
         let lod = if profile.new_cooked_format() {
             read_lod(pkg, &mut r, profile)?
         } else {
             read_lod_legacy(&mut r, profile)?
         };
-        if let Some(lod) = lod {
-            found = Some(lod);
-            lod_index = index;
-            break;
+        match lod {
+            LodRead::Geometry(sections, geometry) => {
+                found = Some((sections, geometry));
+                lod_index = index;
+                break;
+            }
+            LodRead::Empty => {}
+            LodRead::Unavailable(e) => {
+                unavailable = Some(e);
+                if index + 1 < num_lods {
+                    let after = r.pos;
+                    found = (0..LOD_RESYNC_WINDOW).find_map(|skip| {
+                        r.pos = after + skip;
+                        match read_lod(pkg, &mut r, profile) {
+                            Ok(LodRead::Geometry(sections, geometry)) if validate(&sections, &geometry, bones.len(), materials.len()).is_ok() => Some((sections, geometry)),
+                            _ => None,
+                        }
+                    });
+                    lod_index = index + 1;
+                }
+                break;
+            }
         }
     }
-    let (sections, geo) = found.ok_or("no LOD with geometry found")?;
+    let (sections, geo) = found.ok_or_else(|| unavailable.unwrap_or_else(|| "no LOD with geometry found".to_string()))?;
     validate(&sections, &geo, bones.len(), materials.len())?;
     let n = geo.positions.len();
     let mut positions = Vec::with_capacity(n * 3);

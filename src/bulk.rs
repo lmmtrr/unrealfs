@@ -40,31 +40,28 @@ pub fn read_bulk_data<'a>(pkg: &'a Package, r: &mut Reader<'a>) -> Result<Option
     if flags & (BULKDATA_SERIALIZE_COMPRESSED_ZLIB | BULKDATA_COMPRESSED_LZO) != 0 {
         return Err("compressed bulk data is not supported".into());
     }
-    if flags & BULKDATA_OPTIONAL_PAYLOAD != 0 {
-        return Err("optional (.uptnl) bulk data is not supported".into());
-    }
-    let size = size as usize;
-    if flags & BULKDATA_FORCE_INLINE_PAYLOAD != 0 || flags & (BULKDATA_PAYLOAD_AT_END_OF_FILE | BULKDATA_PAYLOAD_IN_SEPARATE_FILE) == 0 {
+    let size = usize::try_from(size).map_err(|_| format!("invalid bulk data size {}", size))?;
+    if flags & BULKDATA_OPTIONAL_PAYLOAD == 0 && (flags & BULKDATA_FORCE_INLINE_PAYLOAD != 0 || flags & (BULKDATA_PAYLOAD_AT_END_OF_FILE | BULKDATA_PAYLOAD_IN_SEPARATE_FILE) == 0) {
         return Ok(Some(r.bytes(size)?));
     }
     if flags & BULKDATA_NO_OFFSET_FIX_UP == 0 {
-        offset += pkg.bulk_data_start_offset;
+        offset = offset.saturating_add(pkg.bulk_data_start_offset);
     }
-    if flags & BULKDATA_PAYLOAD_IN_SEPARATE_FILE != 0 {
-        let ubulk = pkg
-            .ubulk
-            .as_ref()
-            .ok_or_else(|| format!("{} needs its .ubulk file", pkg.path))?;
-        for start in [offset, offset - pkg.bulk_data_start_offset] {
-            if start >= 0 && start as usize + size <= ubulk.len() {
-                return Ok(Some(&ubulk[start as usize..start as usize + size]));
-            }
-        }
-        return Err(format!("bulk data at {} lies outside the .ubulk", offset));
+    if flags & (BULKDATA_PAYLOAD_IN_SEPARATE_FILE | BULKDATA_OPTIONAL_PAYLOAD) != 0 {
+        let (file, ext) = if flags & BULKDATA_OPTIONAL_PAYLOAD != 0 { (&pkg.uptnl, "uptnl") } else { (&pkg.ubulk, "ubulk") };
+        let data = file.as_deref().ok_or_else(|| format!("{} needs its .{} file", pkg.path, ext))?;
+        return [offset, offset.saturating_sub(pkg.bulk_data_start_offset)]
+            .into_iter()
+            .find_map(|start| range(data, start, size))
+            .map(Some)
+            .ok_or_else(|| format!("bulk data at {} lies outside the .{}", offset, ext));
     }
-    let start = offset - pkg.header_size as i64;
-    if start < 0 || start as usize + size > pkg.uexp.len() {
-        return Err(format!("bulk data at {} lies outside the .uexp", offset));
-    }
-    Ok(Some(&pkg.uexp[start as usize..start as usize + size]))
+    range(&pkg.uexp, offset.saturating_sub(pkg.header_size as i64), size)
+        .map(Some)
+        .ok_or_else(|| format!("bulk data at {} lies outside the .uexp", offset))
+}
+
+fn range(data: &[u8], start: i64, size: usize) -> Option<&[u8]> {
+    let start = usize::try_from(start).ok()?;
+    data.get(start..start.checked_add(size)?)
 }

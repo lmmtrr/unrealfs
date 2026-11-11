@@ -351,7 +351,7 @@ fn transfer_per_track_data(c: &Compressed, src: &[u8], num_frames: u32) -> Resul
                 1 => c.track_offsets[track * 2 + 1],
                 _ => c.scale_offsets.get(track * strip).copied().unwrap_or(-1),
             };
-            if offset == -1 {
+            if offset < 0 {
                 continue;
             }
             let mut dst_offset = offset as usize;
@@ -397,8 +397,15 @@ struct CurveKey {
     value: f32,
     arrive: f32,
     leave: f32,
+    arrive_weight: f32,
+    leave_weight: f32,
+    weight_mode: u8,
     mode: u8,
 }
+
+const RCTWM_ARRIVE: u8 = 1;
+const RCTWM_LEAVE: u8 = 2;
+const RCTWM_BOTH: u8 = 3;
 
 const RCCF_EMPTY: u8 = 0;
 const RCCF_CONSTANT: u8 = 1;
@@ -429,14 +436,15 @@ fn decode_rich_curves(curves: &CompressedCurves) -> Result<Vec<Vec<CurveKey>>> {
         let time_format = byte(d + 1)?;
         let num_or_value = f(d + 4)?;
         let num_keys = i32::from_le_bytes(data.get(d + 4..d + 8).ok_or("curve data out of range")?.try_into().unwrap());
-        let base = i32::from_le_bytes(data.get(d + 8..d + 12).ok_or("curve data out of range")?.try_into().unwrap()) as usize;
+        let base = i32::from_le_bytes(data.get(d + 8..d + 12).ok_or("curve data out of range")?.try_into().unwrap());
         if format == RCCF_EMPTY || format == RCCF_CONSTANT {
-            out.push(vec![CurveKey { time: 0.0, value: num_or_value, arrive: 0.0, leave: 0.0, mode: RCCF_CONSTANT }]);
+            out.push(vec![CurveKey { time: 0.0, value: num_or_value, arrive: 0.0, leave: 0.0, arrive_weight: 0.0, leave_weight: 0.0, weight_mode: 0, mode: RCCF_CONSTANT }]);
             continue;
         }
-        if format > RCCF_WEIGHTED || time_format > 1 || num_keys <= 0 {
+        if format > RCCF_WEIGHTED || time_format > 1 || num_keys <= 0 || base < 0 {
             return Err(format!("unsupported curve format {} / {}", format, time_format));
         }
+        let base = base as usize;
         let n = num_keys as usize;
         let modes_size = match format {
             RCCF_MIXED => n,
@@ -475,7 +483,8 @@ fn decode_rich_curves(curves: &CompressedCurves) -> Result<Vec<Vec<CurveKey>>> {
                 _ => format,
             };
             let (arrive, leave) = if stride >= 3 { (f(at + 4)?, f(at + 8)?) } else { (0.0, 0.0) };
-            keys.push(CurveKey { time, value: f(at)?, arrive, leave, mode });
+            let (arrive_weight, leave_weight, weight_mode) = if format == RCCF_WEIGHTED { (f(at + 12)?, f(at + 16)?, byte(base + k * 2 + 1)?) } else { (0.0, 0.0, 0) };
+            keys.push(CurveKey { time, value: f(at)?, arrive, leave, arrive_weight, leave_weight, weight_mode, mode });
         }
         out.push(keys);
     }
@@ -501,6 +510,7 @@ fn eval_curve(keys: &[CurveKey], time: f32) -> f32 {
     match a.mode {
         RCCF_CONSTANT => a.value,
         RCCF_LINEAR => a.value + (b.value - a.value) * u,
+        RCCF_CUBIC if matches!(a.weight_mode, RCTWM_LEAVE | RCTWM_BOTH) || matches!(b.weight_mode, RCTWM_ARRIVE | RCTWM_BOTH) => eval_weighted(&a, &b, time),
         RCCF_CUBIC => {
             let p1 = a.value + a.leave * dt / 3.0;
             let p2 = b.value - b.arrive * dt / 3.0;
@@ -509,6 +519,33 @@ fn eval_curve(keys: &[CurveKey], time: f32) -> f32 {
         }
         _ => a.value,
     }
+}
+
+fn bezier(p0: f32, p1: f32, p2: f32, p3: f32, u: f32) -> f32 {
+    let v = 1.0 - u;
+    v * v * v * p0 + 3.0 * v * v * u * p1 + 3.0 * v * u * u * p2 + u * u * u * p3
+}
+
+fn eval_weighted(a: &CurveKey, b: &CurveKey, time: f32) -> f32 {
+    let dt = b.time - a.time;
+    let handle = |tangent: f32, weight: f32, weighted: bool| {
+        let (sin, cos) = tangent.atan().sin_cos();
+        let length = if weighted { weight } else { dt * (1.0 + tangent * tangent).sqrt() / 3.0 };
+        (cos * length, sin * length)
+    };
+    let (leave_x, leave_y) = handle(a.leave, a.leave_weight, matches!(a.weight_mode, RCTWM_LEAVE | RCTWM_BOTH));
+    let (arrive_x, arrive_y) = handle(b.arrive, b.arrive_weight, matches!(b.weight_mode, RCTWM_ARRIVE | RCTWM_BOTH));
+    let (x1, x2) = (a.time + leave_x, b.time - arrive_x);
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    for _ in 0..32 {
+        let mid = (low + high) * 0.5;
+        if bezier(a.time, x1, x2, b.time, mid) < time {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    bezier(a.value, a.value + leave_y, b.value - arrive_y, b.value, (low + high) * 0.5)
 }
 
 fn read_compressed(pkg: &Package) -> Result<(AnimInfo, Vec<i32>, Compressed)> {
@@ -572,6 +609,13 @@ struct KeyReader<'a> {
 impl KeyReader<'_> {
     fn align4(&mut self) {
         self.r.pos = self.r.pos.div_ceil(4) * 4;
+    }
+
+    fn check_keys(&self, num_keys: usize) -> Result<()> {
+        if num_keys > self.r.data.len() {
+            return Err(format!("implausible key count {}", num_keys));
+        }
+        Ok(())
     }
 
     fn read_times(&mut self, num_keys: usize) -> Result<Vec<f32>> {
@@ -668,7 +712,9 @@ impl KeyReader<'_> {
 
     fn per_track_header(&mut self) -> Result<(u8, u32, usize)> {
         let packed = self.r.u32()?;
-        Ok(((packed >> 28) as u8, (packed >> 24) & 0xf, (packed & 0x00ff_ffff) as usize))
+        let num_keys = (packed & 0x00ff_ffff) as usize;
+        self.check_keys(num_keys)?;
+        Ok(((packed >> 28) as u8, (packed >> 24) & 0xf, num_keys))
     }
 
     fn per_track_quat(&mut self) -> Result<Channel<[f32; 4]>> {
@@ -717,6 +763,7 @@ impl KeyReader<'_> {
     }
 
     fn key_lerp_vector(&mut self, offset: i32, num_keys: usize, format: u8, has_times: bool) -> Result<Channel<[f32; 3]>> {
+        self.check_keys(num_keys)?;
         self.r.pos = offset as usize;
         let format = if num_keys == 1 { ACF_NONE } else { format };
         let (mins, ranges) = if format == ACF_INTERVAL_FIXED32_NO_W { (self.vec3()?, self.vec3()?) } else { ([0.0; 3], [0.0; 3]) };
@@ -736,6 +783,7 @@ impl KeyReader<'_> {
     }
 
     fn key_lerp_quat(&mut self, offset: i32, num_keys: usize, format: u8, has_times: bool) -> Result<Channel<[f32; 4]>> {
+        self.check_keys(num_keys)?;
         self.r.pos = offset as usize;
         let format = if num_keys == 1 { ACF_FLOAT96_NO_W } else { format };
         let (mins, ranges) = if format == ACF_INTERVAL_FIXED32_NO_W { (self.vec3()?, self.vec3()?) } else { ([0.0; 3], [0.0; 3]) };
@@ -842,6 +890,10 @@ fn keyed_tracks(info: &AnimInfo, track_map: &[i32], compressed: &Compressed) -> 
     let per_track = if compressed.key_format == AKF_PER_TRACK_COMPRESSION { 2 } else { 4 };
     if compressed.track_offsets.len() < track_map.len() * per_track {
         return Err("track offsets do not match the track count".into());
+    }
+    let scale_strip = if compressed.key_format == AKF_PER_TRACK_COMPRESSION { 1 } else { 2 };
+    if compressed.scale_strip_size > 0 && !compressed.scale_offsets.is_empty() && compressed.scale_offsets.len() < track_map.len() * scale_strip {
+        return Err("scale offsets do not match the track count".into());
     }
     let mut kr = KeyReader { r: Reader::new(&compressed.stream), num_frames: info.num_frames };
     let mut tracks = Vec::with_capacity(track_map.len());
@@ -952,6 +1004,10 @@ fn sample_curves(curves: &CompressedCurves, frames: usize, fps: f32) -> Result<V
         }
         let mut out = Vec::with_capacity(curves.names.len() * frames);
         for values in &decoded.tracks {
+            if values.is_empty() {
+                out.resize(out.len() + frames, 0.0);
+                continue;
+            }
             out.extend((0..frames).map(|f| {
                 let pos = (f as f32 / fps * decoded.sample_rate).clamp(0.0, (values.len() - 1) as f32);
                 let i = (pos.floor() as usize).min(values.len() - 1);

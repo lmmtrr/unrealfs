@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use crate::package::Package;
 use crate::properties::{PropValue, Properties, read_object_header};
@@ -90,14 +91,8 @@ pub fn read_spine_skeletons(pkg: &Package) -> Vec<Result<SpineSkeleton>> {
         .into_iter()
         .map(|(name, props)| {
             let props = props.map_err(|e| format!("{}: {}", name, e))?;
-            let data: Vec<u8> = match props.get("rawData") {
-                Some(PropValue::Array(items)) => items
-                    .iter()
-                    .map(|v| match v {
-                        PropValue::Int(b) => Ok(*b as u8),
-                        _ => Err(format!("{}: rawData is not a byte array", name)),
-                    })
-                    .collect::<Result<_>>()?,
+            let data = match props.get("rawData") {
+                Some(PropValue::Bytes(bytes)) => bytes.clone(),
                 _ => return Err(format!("{}: skeleton has no rawData", name)),
             };
             Ok(SpineSkeleton { name, file_name: prop_string(&props, "skeletonDataFileName"), data })
@@ -118,6 +113,49 @@ pub fn atlas_page_names(text: &str) -> Vec<String> {
         }
     }
     names
+}
+
+fn rename_atlas_pages(text: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() {
+        return text.to_string();
+    }
+    let mut expect_page = true;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                expect_page = true;
+                return line;
+            }
+            let renamed = if expect_page { renames.get(trimmed).map(String::as_str) } else { None };
+            expect_page = false;
+            renamed.unwrap_or(line)
+        })
+        .collect();
+    lines.join("\n")
+}
+
+fn unique_page_name(owners: &mut HashMap<String, String>, wanted: &str, texture: &str) -> String {
+    let (stem, ext) = wanted.rsplit_once('.').map_or((wanted, None), |(s, e)| (s, Some(e)));
+    let mut candidate = wanted.to_string();
+    let mut n = 2;
+    loop {
+        match owners.get(&candidate.to_ascii_lowercase()) {
+            None => {
+                owners.insert(candidate.to_ascii_lowercase(), texture.to_string());
+                return candidate;
+            }
+            Some(owner) if owner == texture => return candidate,
+            Some(_) => {
+                candidate = match ext {
+                    Some(ext) => format!("{}_{}.{}", stem, n, ext),
+                    None => format!("{}_{}", stem, n),
+                };
+                n += 1;
+            }
+        }
+    }
 }
 
 fn base_key(name: &str) -> String {
@@ -175,6 +213,7 @@ impl crate::UeEnvironment {
         }
         let mut used_names = std::collections::HashSet::new();
         let mut used_pages = std::collections::HashSet::new();
+        let mut page_owners = HashMap::new();
         let mut out = Vec::new();
         for (key, skel) in &skeletons {
             let skel_key = base_key(skel.file_name.as_deref().unwrap_or(&skel.name));
@@ -183,10 +222,12 @@ impl crate::UeEnvironment {
                 .find(|(k, _)| k == key)
                 .or_else(|| if atlases.len() == 1 { atlases.first() } else { None })
                 .or_else(|| {
-                    atlases.iter().max_by_key(|(_, a)| {
-                        let k = base_key(a.file_name.as_deref().unwrap_or(&a.name));
-                        (k == skel_key, common_prefix(&k, &skel_key))
-                    })
+                    atlases
+                        .iter()
+                        .map(|entry| (base_key(entry.1.file_name.as_deref().unwrap_or(&entry.1.name)), entry))
+                        .filter(|(k, _)| common_prefix(k, &skel_key) * 2 >= k.len().max(skel_key.len()))
+                        .max_by_key(|(k, _)| (*k == skel_key, common_prefix(k, &skel_key)))
+                        .map(|(_, entry)| entry)
                 });
             let mut base = safe_file_name(file_stem(skel.file_name.as_deref().unwrap_or(&skel.name)));
             if base.is_empty() {
@@ -204,25 +245,30 @@ impl crate::UeEnvironment {
                 errors.push(format!("{}: no atlas (SpineAtlasAsset) found", skel.name));
                 continue;
             };
-            out.push(SpineOutput { package: atlas_key.clone(), file_name: format!("{}.atlas", base), data: atlas.text.as_bytes().to_vec() });
+            let mut renames = HashMap::new();
             for (page, texture) in atlas_page_names(&atlas.text).iter().zip(&atlas.pages) {
-                let file_name = safe_file_name(page);
                 let found = crate::find_package(&self.packages, texture)
                     .and_then(|pkg| self.packages.iter().find(|(_, p)| std::ptr::eq(*p, pkg)))
                     .ok_or_else(|| format!("{} is not loaded", texture));
                 let result = found.and_then(|(texture_key, pkg)| {
+                    let wanted = safe_file_name(page);
+                    let file_name = unique_page_name(&mut page_owners, &wanted, texture_key);
+                    if file_name != wanted {
+                        renames.insert(page.clone(), file_name.clone());
+                    }
                     if !used_pages.insert((texture_key.clone(), file_name.to_ascii_lowercase())) {
                         return Ok(None);
                     }
                     let t = crate::texture::read_texture(pkg)?;
-                    Ok(Some((texture_key.clone(), encode_png(&t.rgba, t.width as u32, t.height as u32)?)))
+                    Ok(Some((texture_key.clone(), file_name, encode_png(&t.rgba, t.width as u32, t.height as u32)?)))
                 });
                 match result {
-                    Ok(Some((texture_key, data))) => out.push(SpineOutput { package: texture_key, file_name, data }),
+                    Ok(Some((texture_key, file_name, data))) => out.push(SpineOutput { package: texture_key, file_name, data }),
                     Ok(None) => {}
                     Err(e) => errors.push(format!("{}: page {}: {}", atlas.name, page, e)),
                 }
             }
+            out.push(SpineOutput { package: atlas_key.clone(), file_name: format!("{}.atlas", base), data: rename_atlas_pages(&atlas.text, &renames).into_bytes() });
         }
         self.errors.extend(errors);
         Ok(out)

@@ -8,6 +8,7 @@ repository = "https://github.com/lmmtrr/unrealfs"
 readme = "README.md"
 
 [dependencies]
+brotli-decompressor = "6"
 ruzstd = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 texture2ddecoder = "0.1"

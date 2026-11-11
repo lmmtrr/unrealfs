@@ -10,6 +10,7 @@ const PKG_UNVERSIONED_PROPERTIES: u32 = 0x2000;
 const UE5_NAMES_REFERENCED_FROM_EXPORT_DATA: i32 = 1001;
 const UE5_PAYLOAD_TOC: i32 = 1002;
 const UE5_LARGE_WORLD_COORDINATES: i32 = 1004;
+const UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES: i32 = 1007;
 const UE5_ADD_SOFTOBJECTPATH_LIST: i32 = 1008;
 const UE5_DATA_RESOURCES: i32 = 1009;
 const UE5_PROPERTY_TAG_EXTENSION: i32 = 1011;
@@ -17,6 +18,7 @@ const UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME: i32 = 1012;
 const UE5_METADATA_SERIALIZATION_OFFSET: i32 = 1014;
 const UE5_VERSE_CELLS: i32 = 1015;
 const UE5_IMPORT_TYPE_HIERARCHIES: i32 = 1018;
+const MIN_NAME_ENTRY_SIZE: usize = 8;
 
 pub struct ObjectImport {
     pub class_name: String,
@@ -50,10 +52,12 @@ pub struct Package {
     pub ue5_version: i32,
     pub unversioned_properties: bool,
     pub soft_object_path_list: bool,
+    pub soft_object_paths: Vec<String>,
     pub mappings: Option<Arc<Mappings>>,
     pub data_resources: Option<Vec<DataResource>>,
     pub uexp: Vec<u8>,
     pub ubulk: Option<Vec<u8>>,
+    pub uptnl: Option<Vec<u8>>,
 }
 
 struct Summary {
@@ -64,6 +68,7 @@ struct Summary {
     name_count: i32,
     name_offset: i32,
     soft_object_path_count: i32,
+    soft_object_path_offset: i32,
     export_count: i32,
     export_offset: i32,
     import_count: i32,
@@ -129,9 +134,10 @@ fn read_summary(r: &mut Reader, assume_soft_object_paths: bool) -> Result<Summar
     let name_count = r.i32()?;
     let name_offset = r.i32()?;
     let mut soft_object_path_count = 0;
+    let mut soft_object_path_offset = 0;
     if has_ue5(UE5_ADD_SOFTOBJECTPATH_LIST, assume_soft_object_paths) {
         soft_object_path_count = r.i32()?;
-        r.i32()?;
+        soft_object_path_offset = r.i32()?;
     }
     if package_flags & PKG_FILTER_EDITOR_ONLY == 0 && (unversioned || file_version_ue4 >= 516) {
         r.fstring()?;
@@ -211,6 +217,7 @@ fn read_summary(r: &mut Reader, assume_soft_object_paths: bool) -> Result<Summar
         name_count,
         name_offset,
         soft_object_path_count,
+        soft_object_path_offset,
         export_count,
         export_offset,
         import_count,
@@ -246,6 +253,17 @@ fn read_data_resources(r: &mut Reader, offset: i32) -> Result<Vec<DataResource>>
         .collect()
 }
 
+pub fn soft_path_text(package: String, asset: String, sub_path: String) -> String {
+    let mut path = package;
+    if asset != "None" && !asset.is_empty() {
+        path = format!("{}.{}", path, asset);
+    }
+    if !sub_path.is_empty() {
+        path = format!("{}:{}", path, sub_path);
+    }
+    path
+}
+
 pub fn is_package_header(head: &[u8]) -> bool {
     head.len() >= 4 && u32::from_le_bytes([head[0], head[1], head[2], head[3]]) == PACKAGE_TAG
 }
@@ -258,9 +276,25 @@ impl Package {
     pub fn open(uasset: &Path) -> Result<Package> {
         let bytes = std::fs::read(uasset).map_err(|e| format!("{}: {}", uasset.display(), e))?;
         let uexp_path = uasset.with_extension("uexp");
-        let uexp = std::fs::read(&uexp_path).map_err(|e| format!("{}: {}", uexp_path.display(), e))?;
         let ubulk = std::fs::read(uasset.with_extension("ubulk")).ok();
-        Package::parse(&uasset.to_string_lossy(), &bytes, uexp, ubulk)
+        let path = uasset.to_string_lossy();
+        let mut pkg = match std::fs::read(&uexp_path) {
+            Ok(uexp) => Package::parse(&path, &bytes, uexp, ubulk)?,
+            Err(_) if Package::has_embedded_exports(&bytes) => Package::parse_embedded(&path, &bytes, ubulk)?,
+            Err(e) => return Err(format!("{}: {}", uexp_path.display(), e)),
+        };
+        pkg.uptnl = std::fs::read(uasset.with_extension("uptnl")).ok();
+        Ok(pkg)
+    }
+
+    pub fn has_embedded_exports(uasset: &[u8]) -> bool {
+        Package::parse_header("", uasset).is_ok_and(|p| p.header_size > 0 && p.header_size < uasset.len())
+    }
+
+    pub fn parse_embedded(path: &str, uasset: &[u8], ubulk: Option<Vec<u8>>) -> Result<Package> {
+        let mut pkg = Package::parse(path, uasset, Vec::new(), ubulk)?;
+        pkg.uexp = uasset.get(pkg.header_size..).ok_or("package header is larger than the file")?.to_vec();
+        Ok(pkg)
     }
 
     pub fn imported_packages(&self) -> Vec<&str> {
@@ -290,9 +324,11 @@ impl Package {
                 read_summary(&mut r, false).map_err(|_| first)?
             }
         };
-        let mut names = Vec::with_capacity(summary.name_count.max(0) as usize);
+        let name_count = usize::try_from(summary.name_count).ok().filter(|&n| n <= uasset.len() / MIN_NAME_ENTRY_SIZE);
+        let name_count = name_count.ok_or_else(|| format!("invalid name count {}", summary.name_count))?;
+        let mut names = Vec::with_capacity(name_count);
         r.pos = summary.name_offset as usize;
-        for _ in 0..summary.name_count {
+        for _ in 0..name_count {
             names.push(r.fstring()?);
             r.u32()?;
         }
@@ -304,7 +340,16 @@ impl Package {
                 .ok_or_else(|| format!("name index {} out of range", index))?;
             Ok(if number > 0 { format!("{}_{}", base, number - 1) } else { base.clone() })
         };
-        let import_entry_size = match summary.export_offset - summary.import_offset {
+        r.pos = summary.soft_object_path_offset as usize;
+        let soft_object_paths = (0..summary.soft_object_path_count)
+            .map(|_| -> Result<String> {
+                let package = read_name(&mut r)?;
+                let asset = read_name(&mut r)?;
+                Ok(soft_path_text(package, asset, r.fstring()?))
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap_or_default();
+        let import_entry_size = match summary.export_offset.wrapping_sub(summary.import_offset) {
             span if summary.import_count > 0 && span > 0 && [28, 32, 36, 40].contains(&(span / summary.import_count)) => {
                 span / summary.import_count
             }
@@ -313,7 +358,7 @@ impl Package {
         };
         let mut imports = Vec::new();
         for i in 0..summary.import_count {
-            r.pos = (summary.import_offset + i * import_entry_size) as usize;
+            r.pos = summary.import_offset.wrapping_add(i.wrapping_mul(import_entry_size)) as usize;
             let _class_package = read_name(&mut r)?;
             let class_name = read_name(&mut r)?;
             let outer_index = r.i32()?;
@@ -321,13 +366,16 @@ impl Package {
             imports.push(ObjectImport { class_name, outer_index, object_name });
         }
         let export_entry_size = if summary.export_count > 0 {
-            (summary.depends_offset - summary.export_offset) / summary.export_count
+            summary.depends_offset.wrapping_sub(summary.export_offset) / summary.export_count
         } else {
             0
         };
+        if summary.export_count > 0 && export_entry_size <= 0 {
+            return Err(format!("invalid export map layout ({} exports)", summary.export_count));
+        }
         let mut exports = Vec::new();
         for i in 0..summary.export_count {
-            r.pos = (summary.export_offset + i * export_entry_size) as usize;
+            r.pos = summary.export_offset.wrapping_add(i.wrapping_mul(export_entry_size)) as usize;
             let class_index = r.i32()?;
             r.i32()?;
             if summary.is_ue5 || export_entry_size >= 100 {
@@ -361,10 +409,12 @@ impl Package {
             ue5_version: summary.ue5_version,
             unversioned_properties: summary.package_flags & PKG_UNVERSIONED_PROPERTIES != 0,
             soft_object_path_list: summary.soft_object_path_count > 0,
+            soft_object_paths,
             mappings: None,
             data_resources,
             uexp,
             ubulk,
+            uptnl: None,
         })
     }
 
@@ -384,7 +434,7 @@ impl Package {
 
     pub fn object_name(&self, index: i32) -> Option<&str> {
         if index < 0 {
-            self.imports.get((-index - 1) as usize).map(|i| i.object_name.as_str())
+            self.imports.get(-(index + 1) as usize).map(|i| i.object_name.as_str())
         } else if index > 0 {
             self.exports.get((index - 1) as usize).map(|e| e.object_name.as_str())
         } else {
@@ -399,7 +449,10 @@ impl Package {
         let mut parts = Vec::new();
         let mut current = index;
         while current < 0 {
-            let import = self.imports.get((-current - 1) as usize)?;
+            if parts.len() >= self.imports.len() {
+                return None;
+            }
+            let import = self.imports.get(-(current + 1) as usize)?;
             parts.push(import.object_name.clone());
             current = import.outer_index;
         }
@@ -407,16 +460,29 @@ impl Package {
         Some(parts.join("."))
     }
 
+    fn effective_ue5_version(&self) -> i32 {
+        if self.ue5_version != 0 {
+            return self.ue5_version;
+        }
+        self.mappings.as_ref().and_then(|m| m.package_version).map_or(0, |(_, ue5)| ue5)
+    }
+
     pub fn large_world_coordinates(&self) -> bool {
-        self.is_ue5 && (self.ue5_version == 0 || self.ue5_version >= UE5_LARGE_WORLD_COORDINATES)
+        let version = self.effective_ue5_version();
+        self.is_ue5 && (version == 0 || version >= UE5_LARGE_WORLD_COORDINATES)
     }
 
     pub fn property_tag_extensions(&self) -> bool {
-        self.ue5_version >= UE5_PROPERTY_TAG_EXTENSION
+        self.effective_ue5_version() >= UE5_PROPERTY_TAG_EXTENSION
     }
 
     pub fn complete_type_names(&self) -> bool {
-        self.ue5_version >= UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME
+        self.effective_ue5_version() >= UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME
+    }
+
+    pub fn soft_paths_have_asset_names(&self) -> bool {
+        let version = self.effective_ue5_version();
+        self.is_ue5 && (version == 0 || version >= UE5_SOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES)
     }
 
     pub fn export_class_name(&self, export: &ObjectExport) -> Option<&str> {
@@ -424,11 +490,11 @@ impl Package {
     }
 
     pub fn export_data(&self, export: &ObjectExport) -> Result<&[u8]> {
-        let start = export.serial_offset as i64 - self.header_size as i64;
-        let end = start + export.serial_size;
-        if start < 0 || end as usize > self.uexp.len() {
-            return Err(format!("export {} lies outside the .uexp", export.object_name));
-        }
-        Ok(&self.uexp[start as usize..end as usize])
+        let start = usize::try_from(export.serial_offset.saturating_sub(self.header_size as i64)).ok();
+        let size = usize::try_from(export.serial_size).ok();
+        start
+            .zip(size)
+            .and_then(|(start, size)| self.uexp.get(start..start.checked_add(size)?))
+            .ok_or_else(|| format!("export {} lies outside the .uexp", export.object_name))
     }
 }

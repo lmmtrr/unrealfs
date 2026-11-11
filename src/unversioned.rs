@@ -1,5 +1,5 @@
 use crate::package::Package;
-use crate::properties::{PropValue, Properties};
+use crate::properties::{read_soft_object_path, read_text, PropValue, Properties};
 use crate::reader::{Reader, Result};
 use crate::usmap::{Mappings, PropType};
 
@@ -34,6 +34,10 @@ fn read_header(r: &mut Reader) -> Result<(Vec<Fragment>, Vec<bool>)> {
 }
 
 pub fn read_unversioned_properties(pkg: &Package, mappings: &Mappings, r: &mut Reader, struct_name: &str) -> Result<Properties> {
+    r.nested(|r| read_unversioned_body(pkg, mappings, r, struct_name))
+}
+
+fn read_unversioned_body(pkg: &Package, mappings: &Mappings, r: &mut Reader, struct_name: &str) -> Result<Properties> {
     if mappings.find(struct_name).is_none() {
         return Err(format!("{} is not in the .usmap mappings", struct_name));
     }
@@ -106,33 +110,6 @@ fn read_int(r: &mut Reader, ty: &PropType) -> Result<i64> {
     })
 }
 
-fn read_soft_object_path(pkg: &Package, r: &mut Reader) -> Result<()> {
-    if pkg.soft_object_path_list {
-        r.i32()?;
-    } else {
-        pkg.read_name(r)?;
-        if pkg.is_ue5 {
-            pkg.read_name(r)?;
-        }
-        r.fstring()?;
-    }
-    Ok(())
-}
-
-fn read_text(r: &mut Reader) -> Result<String> {
-    r.u32()?;
-    let history = r.u8()? as i8;
-    match history {
-        -1 => Ok(if r.bool32()? { r.fstring()? } else { String::new() }),
-        0 => {
-            r.fstring()?;
-            r.fstring()?;
-            r.fstring()
-        }
-        _ => Err(format!("unsupported FText history type {}", history)),
-    }
-}
-
 fn read_reals(pkg: &Package, r: &mut Reader, n: usize, double: bool) -> Result<Vec<f32>> {
     (0..n)
         .map(|_| if double && pkg.is_ue5 { Ok(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap()) as f32) } else { r.f32() })
@@ -186,10 +163,7 @@ fn read_native_struct(pkg: &Package, r: &mut Reader, name: &str) -> Result<Optio
         "RichCurveKey" => skip(r, 27)?,
         "SimpleCurveKey" => skip(r, 8)?,
         "SmartName" => PropValue::Name(pkg.read_name(r)?),
-        "SoftObjectPath" | "SoftClassPath" => {
-            read_soft_object_path(pkg, r)?;
-            PropValue::Other
-        }
+        "SoftObjectPath" | "SoftClassPath" => PropValue::Name(read_soft_object_path(pkg, r)?),
         "PerPlatformFloat" => {
             r.bool32()?;
             PropValue::Float(r.f32()?)
@@ -247,17 +221,14 @@ fn read_value(pkg: &Package, mappings: &Mappings, r: &mut Reader, ty: &PropType)
             r.skip(16)?;
             PropValue::Other
         }
-        PropType::SoftObject => {
-            read_soft_object_path(pkg, r)?;
-            PropValue::Other
-        }
+        PropType::SoftObject => PropValue::Name(read_soft_object_path(pkg, r)?),
         PropType::Name => PropValue::Name(pkg.read_name(r)?),
         PropType::Str => PropValue::Name(r.fstring()?),
         PropType::Utf8Str | PropType::AnsiStr => {
             let n = r.count(1)?;
             PropValue::Name(String::from_utf8_lossy(r.bytes(n)?).into_owned())
         }
-        PropType::Text => PropValue::Name(read_text(r)?),
+        PropType::Text => PropValue::Name(read_text(pkg, r)?),
         PropType::Delegate => {
             r.i32()?;
             pkg.read_name(r)?;
@@ -272,6 +243,10 @@ fn read_value(pkg: &Package, mappings: &Mappings, r: &mut Reader, ty: &PropType)
             let n = r.count(8)?;
             r.skip(n * 8 + 4)?;
             PropValue::Other
+        }
+        PropType::Array(inner) if matches!(**inner, PropType::Byte) => {
+            let n = r.count(1)?;
+            PropValue::Bytes(r.bytes(n)?.to_vec())
         }
         PropType::Array(inner) => {
             let n = r.count(1)?;
@@ -288,11 +263,14 @@ fn read_value(pkg: &Package, mappings: &Mappings, r: &mut Reader, ty: &PropType)
             for _ in 0..r.count(1)? {
                 read_value(pkg, mappings, r, key)?;
             }
-            for _ in 0..r.count(1)? {
-                read_value(pkg, mappings, r, key)?;
-                read_value(pkg, mappings, r, value)?;
-            }
-            PropValue::Other
+            let n = r.count(1)?;
+            let entries = (0..n)
+                .map(|_| {
+                    let k = read_value(pkg, mappings, r, key)?;
+                    Ok((k, read_value(pkg, mappings, r, value)?))
+                })
+                .collect::<Result<_>>()?;
+            PropValue::Map(entries)
         }
         PropType::Optional(inner) => {
             if r.bool32()? {

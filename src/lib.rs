@@ -6,6 +6,7 @@ pub mod bulk;
 pub mod data_table;
 pub mod material;
 pub mod package;
+pub mod pak;
 pub mod properties;
 pub mod reader;
 pub mod skeletal_mesh;

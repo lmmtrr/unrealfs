@@ -17,8 +17,7 @@ const FROZEN_FOOTER_SIZE: usize = 222;
 const BYTE_COMPRESSION_FOOTER_SIZE: usize = 189;
 const LZ4_MAX_RATIO: usize = 255;
 pub const NOT_PAK_ERROR: &str = "not an Unreal .pak file";
-const OODLE_ERROR: &str = "Oodle-compressed .pak files are not supported";
-const KEY_ERROR: &str = "this .pak is encrypted; set its AES key in Settings";
+pub(crate) const KEY_ERROR: &str = "this .pak is encrypted; set its AES key in Settings";
 const WRONG_KEY_ERROR: &str = "could not read the .pak index; the AES key may be wrong";
 
 struct FooterLayout {
@@ -61,7 +60,11 @@ fn parse_key(text: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn decrypt(data: &mut [u8], key: &[u8; 32]) {
+pub(crate) fn current_key() -> Option<[u8; 32]> {
+    *AES_KEY.read().unwrap()
+}
+
+pub(crate) fn decrypt(data: &mut [u8], key: &[u8; 32]) {
     let cipher = Aes256::new(&(*key).into());
     for chunk in data.chunks_exact_mut(AES_BLOCK) {
         let mut block = aes::Block::try_from(&*chunk).expect("chunk is one AES block");
@@ -70,7 +73,7 @@ fn decrypt(data: &mut [u8], key: &[u8; 32]) {
     }
 }
 
-fn aligned(size: usize) -> usize {
+pub(crate) fn aligned(size: usize) -> usize {
     size.div_ceil(AES_BLOCK) * AES_BLOCK
 }
 
@@ -262,8 +265,7 @@ impl PakFile<Mmap> {
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
         let data = unsafe { Mmap::map(&file) }.map_err(|e| format!("{}: {}", path.display(), e))?;
-        let key = *AES_KEY.read().unwrap();
-        PakFile::parse(data, key)
+        PakFile::parse(data, current_key())
     }
 }
 
@@ -344,7 +346,7 @@ impl<D: AsRef<[u8]>> PakFile<D> {
     }
 }
 
-fn decompress(codec: &str, block: &[u8], limit: usize) -> Result<Vec<u8>> {
+pub(crate) fn decompress(codec: &str, block: &[u8], limit: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let cap = limit as u64 + 1;
     let result = match codec {
@@ -355,7 +357,12 @@ fn decompress(codec: &str, block: &[u8], limit: usize) -> Result<Vec<u8>> {
             decoder.take(cap).read_to_end(&mut out).map(|_| ())
         }
         "lz4" => return lz4_flex::block::decompress(block, limit.min(block.len().saturating_mul(LZ4_MAX_RATIO))).map_err(|e| e.to_string()),
-        "oodle" => return Err(OODLE_ERROR.to_string()),
+        "oodle" => {
+            out.resize(limit, 0);
+            let written = oozextract::Extractor::new().read_from_slice(block, &mut out).map_err(|e| format!("Oodle: {}", e))?;
+            out.truncate(written);
+            return Ok(out);
+        }
         other => return Err(format!("unsupported .pak compression {}", other)),
     };
     result.map_err(|e| e.to_string())?;

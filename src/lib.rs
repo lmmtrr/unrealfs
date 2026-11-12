@@ -4,6 +4,7 @@ pub mod acl;
 pub mod animation;
 pub mod bulk;
 pub mod data_table;
+pub mod iostore;
 pub mod material;
 pub mod package;
 pub mod pak;
@@ -15,6 +16,7 @@ pub mod static_mesh;
 pub mod texture;
 pub mod unversioned;
 pub mod usmap;
+pub mod zen;
 
 use animation::{read_anim_contents, read_anim_info, read_animation, read_skeleton_bones, AnimInfo, SampledAnimation};
 use material::read_material;

@@ -17,8 +17,8 @@ const FROZEN_FOOTER_SIZE: usize = 222;
 const BYTE_COMPRESSION_FOOTER_SIZE: usize = 189;
 const LZ4_MAX_RATIO: usize = 255;
 pub const NOT_PAK_ERROR: &str = "not an Unreal .pak file";
-pub(crate) const KEY_ERROR: &str = "this .pak is encrypted; set its AES key in Settings";
-const WRONG_KEY_ERROR: &str = "could not read the .pak index; the AES key may be wrong";
+pub const KEY_ERROR: &str = "this .pak is encrypted; set its AES key in Settings";
+pub const WRONG_KEY_ERROR: &str = "could not read the .pak index; the AES key may be wrong";
 
 struct FooterLayout {
     size: usize,

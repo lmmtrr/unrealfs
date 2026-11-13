@@ -274,6 +274,7 @@ impl Package {
     }
 
     pub fn open(uasset: &Path) -> Result<Package> {
+        crate::lazy::ensure(uasset)?;
         let bytes = std::fs::read(uasset).map_err(|e| format!("{}: {}", uasset.display(), e))?;
         let uexp_path = uasset.with_extension("uexp");
         let ubulk = std::fs::read(uasset.with_extension("ubulk")).ok();

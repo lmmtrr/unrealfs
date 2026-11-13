@@ -5,6 +5,7 @@ pub mod animation;
 pub mod bulk;
 pub mod data_table;
 pub mod iostore;
+pub mod lazy;
 pub mod material;
 pub mod package;
 pub mod pak;
@@ -94,6 +95,7 @@ pub fn is_unreal_file(path: &str) -> bool {
 }
 
 pub fn package_files(uasset: &Path) -> Vec<PathBuf> {
+    let _ = lazy::ensure(uasset);
     let mut out = vec![uasset.to_path_buf()];
     for ext in ["uexp", "ubulk", "uptnl"] {
         let p = uasset.with_extension(ext);

@@ -24,7 +24,7 @@ const PKG_FILTER_EDITOR_ONLY: u32 = 0x8000_0000;
 const UE5_EXPORT_SIZE: usize = 44;
 const UE4_EXPORT_SIZE: usize = 96;
 const MAX_OUTER_DEPTH: usize = 64;
-const GLOBAL_ERROR: &str = "IoStore packages need global.utoc/global.ucas from the same folder";
+pub const GLOBAL_ERROR: &str = "IoStore packages need global.utoc/global.ucas from the same folder";
 
 #[derive(Clone, Copy)]
 struct MappedName {
@@ -117,6 +117,10 @@ fn u64s(r: &mut Reader, count: usize) -> Result<Vec<u64>> {
 
 fn span(from: usize, to: usize, size: usize) -> Result<usize> {
     to.checked_sub(from).map(|n| n / size).ok_or_else(|| format!("invalid IoStore package layout ({} > {})", from, to))
+}
+
+fn uasset_path(path: &Path) -> PathBuf {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("umap")) { path.to_path_buf() } else { path.with_extension("uasset") }
 }
 
 fn name_text(base: &str, number: u32) -> String {
@@ -800,6 +804,17 @@ impl IoStoreSet {
         out
     }
 
+    pub fn extract_header(&self, entry: &IoEntry) -> Option<(PathBuf, Vec<u8>)> {
+        let store = self.stores.get(entry.store)?;
+        let id = store.chunks.get(entry.chunk)?;
+        if id.kind != ChunkKind::ExportBundleData.code(store.ue5) {
+            return None;
+        }
+        let package = self.packages.get(&id.id).filter(|p| p.store == entry.store)?;
+        let (uasset, _) = self.convert_parts(&package.header, None, store.chunk_size(entry.chunk));
+        Some((uasset_path(&entry.path), uasset))
+    }
+
     pub fn extract(&self, entry: &IoEntry) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         let store = self.stores.get(entry.store).ok_or("invalid IoStore container")?;
         let data = store.read(entry.chunk)?;
@@ -809,11 +824,14 @@ impl IoStoreSet {
         }
         let header = parse_header(&data, store.ue5, self.entries.get(&id.id)).map_err(|e| format!("{}: {}", entry.path.display(), e))?;
         let (uasset, uexp) = self.convert(&header, &data);
-        let uasset_path = if entry.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("umap")) { entry.path.clone() } else { entry.path.with_extension("uasset") };
-        Ok(vec![(entry.path.with_extension("uexp"), uexp), (uasset_path, uasset)])
+        Ok(vec![(entry.path.with_extension("uexp"), uexp), (uasset_path(&entry.path), uasset)])
     }
 
     fn convert(&self, pkg: &ZenHeader, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        self.convert_parts(pkg, Some(data), data.len())
+    }
+
+    fn convert_parts(&self, pkg: &ZenHeader, data: Option<&[u8]>, chunk_len: usize) -> (Vec<u8>, Vec<u8>) {
         let mut b = Builder {
             set: self,
             pkg,
@@ -836,6 +854,7 @@ impl IoStoreSet {
         let layout = pkg.layout();
         let chs = pkg.cooked_header_size;
         let mut uexp = Vec::new();
+        let mut uexp_len = 0;
         let mut source_end = pkg.data_start;
         let mut exports = Vec::with_capacity(pkg.exports.len());
         for (export, place) in pkg.exports.iter().zip(&layout) {
@@ -847,20 +866,27 @@ impl IoStoreSet {
             let mut offset = chs as i64;
             let mut size = 0i64;
             if let Some((src, dest)) = *place {
-                let bytes = data.get(src..src.saturating_add(export.size as usize)).unwrap_or_default();
+                let end = src.saturating_add(export.size as usize);
+                let len = if end <= chunk_len { export.size as usize } else { 0 };
                 let at = (dest - chs) as usize;
-                if uexp.len() < at + bytes.len() {
-                    uexp.resize(at + bytes.len(), 0);
+                uexp_len = uexp_len.max(at + len);
+                if let Some(bytes) = data.and_then(|d| d.get(src..src + len)) {
+                    if uexp.len() < at + len {
+                        uexp.resize(at + len, 0);
+                    }
+                    uexp[at..at + len].copy_from_slice(bytes);
                 }
-                uexp[at..at + bytes.len()].copy_from_slice(bytes);
-                source_end = source_end.max(src + bytes.len());
+                source_end = source_end.max(src + len);
                 offset = dest as i64;
-                size = bytes.len() as i64;
+                size = len as i64;
             }
             exports.push((class, super_index, template, outer, name, export.flags, size, offset));
         }
-        let bulk_start = chs as i64 + uexp.len() as i64;
-        uexp.extend_from_slice(data.get(source_end..).unwrap_or_default());
+        let bulk_start = chs as i64 + uexp_len as i64;
+        if let Some(data) = data {
+            uexp.resize(uexp_len, 0);
+            uexp.extend_from_slice(data.get(source_end..).unwrap_or_default());
+        }
         let imports: Vec<Import> = b.imports.drain(..).map(|i| i.unwrap_or(Import { class: (0, 0), outer: 0, name: (0, 0) })).collect();
         let class_package = b.intern("/Script/CoreUObject");
         let ue5 = pkg.ue5;
@@ -1019,6 +1045,7 @@ mod tests {
         let header = parse_header(&data, true, None).unwrap();
         assert_eq!(header.name, "/Game/Mesh");
         let (uasset, uexp) = set().convert(&header, &data);
+        assert_eq!(set().convert_parts(&header, None, data.len()), (uasset.clone(), Vec::new()));
         let pkg = Package::parse("Mesh.uasset", &uasset, uexp, None).unwrap();
         assert!(pkg.is_ue5 && pkg.unversioned_properties);
         assert_eq!(pkg.header_size, 1000);
@@ -1061,6 +1088,7 @@ mod tests {
         };
         let data = [0, 0, 0, 0, 7, 8, 9, 5, 6];
         let (uasset, uexp) = set().convert(&header, &data);
+        assert_eq!(set().convert_parts(&header, None, data.len()), (uasset.clone(), Vec::new()));
         let pkg = Package::parse("Mesh.uasset", &uasset, uexp, None).unwrap();
         assert!(!pkg.is_ue5 && pkg.data_resources.is_none());
         assert_eq!(pkg.export_data(&pkg.exports[0]).unwrap(), &[5, 6]);

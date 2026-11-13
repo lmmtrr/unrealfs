@@ -17,7 +17,7 @@ const NO_ENTRY: u32 = u32::MAX;
 const BLOCK_ENTRY_SIZE: usize = 12;
 const SHA_SIZE: usize = 20;
 pub const NOT_UTOC_ERROR: &str = "not an IoStore .utoc file";
-const WRONG_KEY_ERROR: &str = "could not read the .utoc directory index; the AES key may be wrong";
+pub const WRONG_KEY_ERROR: &str = "could not read the .utoc directory index; the AES key may be wrong";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId {
